@@ -27,6 +27,14 @@
 const frame = document.getElementById("timer-frame");
 let currentDocument = null;
 let currentTheme = {};
+// PER_TIMER_CHART_COLORS_V1
+let currentVisual = {};
+
+function validChartColor(value, fallback) {
+    return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)
+        ? value
+        : fallback;
+}
 let currentHeight = 300;
 
 function send(type, properties = {}) {
@@ -88,17 +96,30 @@ function updateTheme() {
         .chart-percent {
             fill: var(--timer-primary) !important;
         }
+        .ring-elapsed {
+            stroke: var(--timer-donut) !important;
+        }
+        .progress-fill {
+            background: var(--blue) !important;
+        }
     `;
 
     const root = document.documentElement;
     root.style.setProperty("--timer-background", colors.background);
     root.style.setProperty("--timer-text", colors.text);
-    root.style.setProperty("--timer-primary", colors.primary);
+    const barColor = validChartColor(
+        currentVisual.bar_color, colors.primary
+    );
+    const donutColor = validChartColor(
+        currentVisual.donut_color, barColor
+    );
+    root.style.setProperty("--timer-primary", donutColor);
+    root.style.setProperty("--timer-donut", donutColor);
 
     // Override the existing light/dark media-query variables.
     root.style.setProperty("--text", colors.text, "important");
     root.style.setProperty("--muted", colors.text, "important");
-    root.style.setProperty("--blue", colors.primary, "important");
+    root.style.setProperty("--blue", barColor, "important");
     root.style.setProperty(
         "--track",
         "color-mix(in srgb, " + colors.text + " 22%, "
@@ -128,6 +149,10 @@ window.addEventListener("message", event => {
 
     const args = message.args || {};
     currentTheme = message.theme || {};
+    currentVisual = {
+        bar_color: args.bar_color,
+        donut_color: args.donut_color
+    };
     currentHeight = Number(args.height) || 310;
 
     frame.style.height = currentHeight + "px";

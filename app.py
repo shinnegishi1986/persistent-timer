@@ -2434,6 +2434,44 @@ def _timer_editor_content(user, mode):
     elif callable(globals().get("completion_chime")):
         st.audio(completion_chime(), format="audio/wav")
 
+
+    visual_defaults = load_timer_visual_preferences(
+        source.get("id"), user["id"]
+    )
+
+    st.caption("Timer chart colors / タイマーのチャート色")
+
+    chosen_same_color = st.checkbox(
+        "Use the same color for bar and donut / バーとドーナツを同じ色にする",
+        value=visual_defaults["same_color"],
+        key=f"{prefix}_same_chart_color",
+    )
+
+    bar_column, donut_column = st.columns(2)
+    chosen_bar_color = bar_column.color_picker(
+        "Progress bar color / 進捗バーの色",
+        value=visual_defaults["bar_color"],
+        key=f"{prefix}_bar_color",
+    )
+
+    if chosen_same_color:
+        chosen_donut_color = chosen_bar_color
+        donut_column.caption(
+            "Donut uses the progress-bar color. "
+            "ドーナツも進捗バーと同じ色を使用します。"
+        )
+    else:
+        chosen_donut_color = donut_column.color_picker(
+            "Donut elapsed color / ドーナツの経過部分の色",
+            value=visual_defaults["donut_color"],
+            key=f"{prefix}_donut_color",
+        )
+
+    st.caption(
+        "Colors are applied when you save the timer. "
+        "色はタイマーを保存すると反映されます。"
+    )
+
     parent_options = [None] + [
         timer_id for timer_id in by_id if timer_id != edit_target_id
     ]
@@ -2587,6 +2625,25 @@ def _timer_editor_content(user, mode):
                     "INSERT INTO timer_alarm_sounds(timer_id,sound_id) VALUES (?,?)",
                     (timer_id, sound_id),
                 )
+
+
+            connection.execute(
+                """
+                INSERT INTO timer_visual_preferences
+                (timer_id,bar_color,donut_color,same_color)
+                VALUES (?,?,?,?)
+                ON CONFLICT(timer_id) DO UPDATE SET
+                    bar_color=excluded.bar_color,
+                    donut_color=excluded.donut_color,
+                    same_color=excluded.same_color
+                """,
+                (
+                    timer_id,
+                    timer_visual_color(chosen_bar_color),
+                    timer_visual_color(chosen_donut_color),
+                    int(chosen_same_color),
+                ),
+            )
 
         if creating:
             st.session_state["_fixed_new_timer_epoch"] = epoch + 1
@@ -3004,7 +3061,12 @@ if (!frozen) requestAnimationFrame(animate);
         "timer_theme_appearance_v1",
         path=str(Path(__file__).resolve().parent / "timer_theme_component"),
     )
+    visual_settings = load_timer_visual_preferences(
+        timer["id"], timer["user_id"]
+    )
     theme_component(
+        bar_color=visual_settings["bar_color"],
+        donut_color=visual_settings["donut_color"],
         document=document,
         height=310,
         key=f"timer_theme_{timer['id']}",
@@ -3215,9 +3277,70 @@ def save_sound_preference_from_checkbox(user_id):
         )
 
 
+
+# PER_TIMER_CHART_COLORS_V1
+
+def initialize_timer_visual_preferences():
+    with database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timer_visual_preferences (
+                timer_id TEXT PRIMARY KEY
+                    REFERENCES timers(id) ON DELETE CASCADE,
+                bar_color TEXT NOT NULL DEFAULT '#2563EB',
+                donut_color TEXT NOT NULL DEFAULT '#2563EB',
+                same_color INTEGER NOT NULL DEFAULT 1
+                    CHECK(same_color IN (0,1))
+            )
+            """
+        )
+
+
+def timer_visual_color(value, fallback="#2563EB"):
+    text = str(value or "")
+    if (
+        len(text) == 7
+        and text.startswith("#")
+        and all(character in "0123456789abcdefABCDEF" for character in text[1:])
+    ):
+        return text.upper()
+    return fallback
+
+
+def load_timer_visual_preferences(timer_id, user_id):
+    result = rows(
+        """
+        SELECT p.bar_color,p.donut_color,p.same_color
+        FROM timer_visual_preferences p
+        JOIN timers t ON t.id=p.timer_id
+        WHERE t.id=? AND t.user_id=?
+        """,
+        (timer_id or "", user_id),
+    )
+
+    if not result:
+        return {
+            "bar_color": "#2563EB",
+            "donut_color": "#2563EB",
+            "same_color": True,
+        }
+
+    setting = result[0]
+    bar = timer_visual_color(setting["bar_color"])
+    same = bool(setting["same_color"])
+    return {
+        "bar_color": bar,
+        "donut_color": (
+            bar if same else timer_visual_color(setting["donut_color"])
+        ),
+        "same_color": same,
+    }
+
+
 def main():
     apply_delete_timer_button_color()
     initialize()
+    initialize_timer_visual_preferences()
     initialize_sound_preferences()
     initialize_quit_history()
     initialize_custom_audio()
