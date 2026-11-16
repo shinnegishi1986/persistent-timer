@@ -2681,6 +2681,7 @@ def _fixed_delete_timer_dialog(timer_id):
 
 def _fixed_timer_statistics(timer, quit_record, now):
     import json as smooth_json
+    from pathlib import Path
     import streamlit.components.v1 as smooth_components
 
     start = parse_stamp(timer["starts_at"])
@@ -2998,7 +2999,17 @@ if (!frozen) requestAnimationFrame(animate);
         "__SMOOTH_TIMER_CONFIGURATION__",
         smooth_json.dumps(payload, allow_nan=False),
     )
-    smooth_components.html(document, height=285, scrolling=False)
+    # TIMER_THEME_APPEARANCE_PATCH_V1
+    theme_component = smooth_components.declare_component(
+        "timer_theme_appearance_v1",
+        path=str(Path(__file__).resolve().parent / "timer_theme_component"),
+    )
+    theme_component(
+        document=document,
+        height=310,
+        key=f"timer_theme_{timer['id']}",
+        default=None,
+    )
 
 
 @st.fragment(run_every="30s")

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        background: transparent;
+    }
+    #timer-frame {
+        display: block;
+        width: 100%;
+        border: 0;
+        border-radius: 12px;
+        overflow: hidden;
+    }
+</style>
+</head>
+<body>
+<iframe id="timer-frame" title="Timer statistics / タイマー統計"></iframe>
+<script>
+"use strict";
+
+const frame = document.getElementById("timer-frame");
+let currentDocument = null;
+let currentTheme = {};
+let currentHeight = 300;
+
+function send(type, properties = {}) {
+    window.parent.postMessage(
+        Object.assign(
+            {isStreamlitMessage: true, type: type},
+            properties
+        ),
+        "*"
+    );
+}
+
+function themeColors(theme) {
+    const text = theme.textColor || "#172033";
+    const background = theme.secondaryBackgroundColor
+        || theme.backgroundColor
+        || "#F1F5F9";
+    const primary = theme.primaryColor || "#2563EB";
+    const font = theme.font || "system-ui, sans-serif";
+
+    return {text, background, primary, font};
+}
+
+function updateTheme() {
+    const document = frame.contentDocument;
+    if (!document || !document.head) return;
+
+    const colors = themeColors(currentTheme);
+    let style = document.getElementById("streamlit-timer-theme");
+    if (!style) {
+        style = document.createElement("style");
+        style.id = "streamlit-timer-theme";
+        document.head.appendChild(style);
+    }
+
+    // CSSOM assignments avoid treating theme values as HTML or JavaScript.
+    style.textContent = `
+        :root {
+            color-scheme: normal !important;
+        }
+        html, body {
+            background: var(--timer-background) !important;
+            color: var(--timer-text) !important;
+        }
+        body {
+            padding: 16px 12px !important;
+            border-radius: 12px;
+        }
+        .label, .note, .legend {
+            color: var(--timer-text) !important;
+            opacity: 0.76;
+        }
+        .value {
+            color: var(--timer-text) !important;
+        }
+        .progress, .ring-track {
+            opacity: 1;
+        }
+        .chart-percent {
+            fill: var(--timer-primary) !important;
+        }
+    `;
+
+    const root = document.documentElement;
+    root.style.setProperty("--timer-background", colors.background);
+    root.style.setProperty("--timer-text", colors.text);
+    root.style.setProperty("--timer-primary", colors.primary);
+
+    // Override the existing light/dark media-query variables.
+    root.style.setProperty("--text", colors.text, "important");
+    root.style.setProperty("--muted", colors.text, "important");
+    root.style.setProperty("--blue", colors.primary, "important");
+    root.style.setProperty(
+        "--track",
+        "color-mix(in srgb, " + colors.text + " 22%, "
+            + colors.background + ")",
+        "important"
+    );
+
+    document.body.style.fontFamily = colors.font;
+    frame.style.backgroundColor = colors.background;
+
+    // A fallback for browsers without color-mix().
+    if (!CSS.supports(
+        "color",
+        "color-mix(in srgb, black 20%, white)"
+    )) {
+        root.style.setProperty("--track", "#94A3B8", "important");
+    }
+}
+
+frame.addEventListener("load", updateTheme);
+
+window.addEventListener("message", event => {
+    if (event.source !== window.parent) return;
+
+    const message = event.data;
+    if (!message || message.type !== "streamlit:render") return;
+
+    const args = message.args || {};
+    currentTheme = message.theme || {};
+    currentHeight = Number(args.height) || 310;
+
+    frame.style.height = currentHeight + "px";
+
+    if (typeof args.document === "string"
+        && args.document !== currentDocument) {
+        currentDocument = args.document;
+        frame.srcdoc = currentDocument;
+    } else {
+        // A theme-only update does not restart the timer animation.
+        updateTheme();
+    }
+
+    send("streamlit:setFrameHeight", {height: currentHeight});
+});
+
+send("streamlit:componentReady", {apiVersion: 1});
+</script>
+</body>
+</html>
