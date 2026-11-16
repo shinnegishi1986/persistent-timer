@@ -2932,8 +2932,9 @@ def _fixed_timer_statistics(timer, quit_record, now):
                   x="100" y="107" text-anchor="middle">—</text>
         </svg>
         <div class="legend">
-            <span class="dot" style="background:var(--blue)"></span>
-            Elapsed / 経過<br>
+            <span class="dot timer-elapsed-dot"
+                  style="background:var(--timer-donut, var(--blue))"></span>
+            <span class="timer-elapsed-legend">Elapsed / 経過</span><br>
             <span class="dot" style="background:var(--track)"></span>
             Remaining / 残り
         </div>

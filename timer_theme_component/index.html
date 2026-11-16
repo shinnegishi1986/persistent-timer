@@ -99,6 +99,14 @@ function updateTheme() {
         .ring-elapsed {
             stroke: var(--timer-donut) !important;
         }
+
+        /* DONUT_ELAPSED_LEGEND_COLOR_FIX_V1 */
+        .legend .timer-elapsed-dot {
+            background: var(--timer-donut, var(--blue)) !important;
+        }
+        .legend .timer-elapsed-legend {
+            color: var(--timer-donut, var(--blue)) !important;
+        }
         .progress-fill {
             background: var(--blue) !important;
         }
