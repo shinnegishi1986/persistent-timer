@@ -3470,12 +3470,11 @@ def timer_share_dialog(timer_id):
         "リンクを知っている人はタイトル・説明・日時・進捗・中断状態を閲覧できます。"
     )
 
-    base_url = st.text_input(
-        "Deployed app URL / 公開アプリURL",
-        value=os.environ.get("TIMER_PUBLIC_BASE_URL", ""),
-        placeholder="https://your-app.streamlit.app/",
-        key=f"_timer_share_base_{timer_id}",
-    )
+    try:
+        base_url = retrieve_timer_public_base_url()
+    except ValueError as error:
+        st.error(str(error))
+        return
 
     current_link = rows(
         "SELECT token_hash FROM timer_public_links WHERE timer_id=?",
@@ -3649,6 +3648,48 @@ def handle_public_timer_request():
     initialize_timer_visual_preferences()
     render_public_shared_timer(token)
     return True
+
+
+
+# AUTOMATIC_TIMER_SHARE_URL_V1
+
+def retrieve_timer_public_base_url():
+    from urllib.parse import unquote, urlsplit, urlunsplit
+
+    # A deployment-provided canonical URL overrides automatic detection.
+    explicit = os.environ.get("TIMER_PUBLIC_BASE_URL", "").strip()
+    if explicit:
+        return timer_share_base_url(explicit)
+
+    try:
+        detected = st.context.url
+    except (AttributeError, KeyError):
+        detected = None
+
+    if not isinstance(detected, str) or not detected.strip():
+        raise ValueError(
+            "Automatic URL detection requires a newer Streamlit version. "
+            "Upgrade Streamlit or configure TIMER_PUBLIC_BASE_URL. "
+            "自動URL取得には新しいStreamlitが必要です。"
+            "更新するか TIMER_PUBLIC_BASE_URL を設定してください。"
+        )
+
+    parsed = urlsplit(timer_share_base_url(detected))
+
+    # st.context.url includes the current multipage route. Public links must
+    # target the app entry point, where the pre-login share handler runs.
+    page_routes = ['account', 'admin', 'csv', 'journal', 'quit-dashboard', 'timer-editor', 'timers']
+    path = parsed.path or "/"
+    trimmed_path = path.rstrip("/")
+    final_segment = unquote(trimmed_path.rsplit("/", 1)[-1])
+
+    if final_segment in page_routes:
+        parent_path = trimmed_path.rsplit("/", 1)[0]
+        path = (parent_path or "") + "/"
+
+    return timer_share_base_url(
+        urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    )
 
 
 def main():
