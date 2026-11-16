@@ -1,3 +1,4 @@
 scripts/
 *.bat
 *.ps1
+*.backup*
