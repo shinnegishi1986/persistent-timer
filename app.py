@@ -1037,10 +1037,17 @@ def audio_notification_controls(user_id):
     state.setdefault("_audio_pending", [])
     state.setdefault("_audio_player_visible", False)
 
+    # The database is authoritative across browser sessions/devices.
+    # A local checkbox interaction runs its save callback before this code.
+    saved_enabled = saved_sound_preference(user_id)
+    if state.get("_audio_enabled") != saved_enabled:
+        state["_audio_enabled"] = saved_enabled
+
     enabled = st.checkbox(
         "Enable sound / 終了音を有効化",
-        value=False,
         key="_audio_enabled",
+        on_change=save_sound_preference_from_checkbox,
+        args=(user_id,),
     )
 
     if not enabled:
@@ -3097,8 +3104,110 @@ def timer_dashboard(user_id):
         st.info("No matching timers / 該当するタイマーはありません。")
 
 
+
+# DELETE_TIMER_BUTTON_COLOR_V1
+
+def apply_delete_timer_button_color():
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-_fixed_delete_timer_"] button,
+        div[class*="st-key-delete_timer_"] button {
+            background-color: #B91C1C !important;
+            border: 1px solid #B91C1C !important;
+            color: #FFFFFF !important;
+        }
+
+        div[class*="st-key-_fixed_delete_timer_"] button *,
+        div[class*="st-key-delete_timer_"] button * {
+            color: #FFFFFF !important;
+        }
+
+        div[class*="st-key-_fixed_delete_timer_"] button:hover,
+        div[class*="st-key-delete_timer_"] button:hover {
+            background-color: #991B1B !important;
+            border-color: #991B1B !important;
+        }
+
+        div[class*="st-key-_fixed_delete_timer_"] button:active,
+        div[class*="st-key-delete_timer_"] button:active {
+            background-color: #7F1D1D !important;
+            border-color: #7F1D1D !important;
+        }
+
+        div[class*="st-key-_fixed_delete_timer_"] button:focus-visible,
+        div[class*="st-key-delete_timer_"] button:focus-visible {
+            outline: 3px solid #FCA5A5 !important;
+            outline-offset: 3px !important;
+        }
+
+        div[class*="st-key-_fixed_delete_timer_"] button:disabled,
+        div[class*="st-key-delete_timer_"] button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+# SOUND_CHECKBOX_DB_PERSISTENCE_V1
+
+def initialize_sound_preferences():
+    with database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sound_preferences (
+                user_id TEXT PRIMARY KEY
+                    REFERENCES users(id) ON DELETE CASCADE,
+                sound_enabled INTEGER NOT NULL DEFAULT 0
+                    CHECK(sound_enabled IN (0, 1)),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def saved_sound_preference(user_id):
+    result = rows(
+        """
+        SELECT sound_enabled
+        FROM user_sound_preferences
+        WHERE user_id=?
+        """,
+        (user_id,),
+    )
+    return bool(result[0]["sound_enabled"]) if result else False
+
+
+def save_sound_preference_from_checkbox(user_id):
+    # Do not allow a stale browser callback to change another user's setting.
+    user = current_user()
+    if not user or user["id"] != user_id:
+        return
+
+    enabled = int(bool(st.session_state.get("_audio_enabled", False)))
+
+    with database() as connection:
+        connection.execute(
+            """
+            INSERT INTO user_sound_preferences
+            (user_id,sound_enabled,updated_at)
+            VALUES (?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                sound_enabled=excluded.sound_enabled,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, enabled, stamp()),
+        )
+
+
 def main():
+    apply_delete_timer_button_color()
     initialize()
+    initialize_sound_preferences()
     initialize_quit_history()
     initialize_custom_audio()
     initialize_persistent_auth()
