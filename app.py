@@ -3008,8 +3008,7 @@ def timer_dashboard(user_id):
     statuses = ["All / すべて", "Current / 進行中", "Future / 予定",
                 "Past / 終了", "Quit / 中断"]
     selected_status = st.selectbox(
-        "Filter / 表示", statuses, key="_fixed_timer_status_filter"
-    )
+        "Filter / 表示", statuses, key="_fixed_timer_status_filter", label_visibility="collapsed")
 
     children = {}
     roots = []
@@ -3140,14 +3139,8 @@ def main():
     # Native navigation uses links and highlights the active page.
     # Callable pages preserve the authenticated Streamlit session.
     def render_timers():
-        st.title("Timers / タイマー")
-        st.caption(
-            "Countdowns are calculated from persisted timestamps. They stay accurate "
-            "when the browser is closed; audio alerts require this app to remain open and connected."
-            "\n\n"
-            "保存された日時から残り時間を計算します。ブラウザを閉じても継続します。"
-            "通知音にはアプリを開いた状態と接続が必要です。"
-        )
+        pass
+        pass
         timer_dashboard(user["id"])
 
     def render_editor():
