@@ -1,0 +1,1208 @@
+# UI_APPEARANCE_PATCH_V1
+# app.py
+#
+# Install:
+#   pip install "streamlit>=1.37" "python-dateutil>=2.9"
+#
+# Run:
+#   streamlit run app.py
+#
+# Initial administrator:
+#   Username: timer-admin
+#   Password: tadmin123@
+#
+# Change the initial administrator password after the first login.
+#
+# Persistence:
+#   SQLite database: ./data/timer_app.sqlite3
+#   Attachments are stored inside SQLite.
+#   Mount ./data on a persistent volume when deploying.
+#   Use a single application instance with SQLite.
+#
+# CSV:
+#   UTF-8 with BOM for Japanese Excel compatibility.
+#   Timer CSV includes hierarchy and reusable duration settings.
+#   Journal CSV includes attachments encoded as JSON/base64.
+#   CSV imports create new records rather than overwriting existing records.
+#
+# Authentication:
+#   Passwords use PBKDF2-HMAC-SHA256 with random salts.
+#   Authentication lasts for the current Streamlit session.
+#   Serve the application over HTTPS in production.
+
+import base64
+import calendar
+import csv
+import hashlib
+import hmac
+import io
+import json
+import math
+import os
+import secrets
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import streamlit as st
+from dateutil.relativedelta import relativedelta
+
+
+st.set_page_config(
+    page_title="Persistent Timers & Journal",
+    page_icon="⏱",
+    layout="wide",
+)
+
+DATA_DIR = Path(os.environ.get("TIMER_DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "timer_app.sqlite3"
+
+UTC = timezone.utc
+JST = ZoneInfo("Asia/Tokyo")
+UNITS = ["hours", "days", "weeks", "months", "years", "until"]
+UNIT_LABELS = {
+    "hours": "Hours / 時間",
+    "days": "Days / 日",
+    "weeks": "Weeks / 週",
+    "months": "Months / 月",
+    "years": "Years / 年",
+    "until": "Until date / 指定日まで",
+}
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_POST_BYTES = 30 * 1024 * 1024
+MAX_CSV_BYTES = 50 * 1024 * 1024
+MAX_IMPORT_ROWS = 1000
+PASSWORD_ROUNDS = 600_000
+DUMMY_SALT = bytes.fromhex("cd" * 16)
+
+
+@contextmanager
+def database():
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def utc_now():
+    return datetime.now(UTC)
+
+
+def stamp(value=None):
+    return (value or utc_now()).astimezone(UTC).isoformat()
+
+
+def parse_stamp(value):
+    result = datetime.fromisoformat(str(value))
+    if result.tzinfo is None:
+        raise ValueError("Dates must include a timezone / 日時にはタイムゾーンが必要です。")
+    return result.astimezone(UTC)
+
+
+def local_text(value):
+    return parse_stamp(value).astimezone(JST).strftime("%Y-%m-%d %H:%M JST")
+
+
+def identifier():
+    return str(uuid.uuid4())
+
+
+def password_hash(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_ROUNDS
+    )
+    return f"{PASSWORD_ROUNDS}${salt.hex()}${digest.hex()}"
+
+
+def password_matches(password, stored):
+    try:
+        rounds, salt_hex, expected = stored.split("$")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            int(rounds),
+        )
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_password(password):
+    if len(password) < 10:
+        raise ValueError("Password must have at least 10 characters / パスワードは10文字以上。")
+    if len(password) > 1024:
+        raise ValueError("Password is too long / パスワードが長すぎます。")
+
+
+def validate_username(username):
+    username = username.strip()
+    if not 3 <= len(username) <= 80:
+        raise ValueError("Username must have 3–80 characters / ユーザー名は3〜80文字。")
+    if any(ord(character) < 32 for character in username):
+        raise ValueError("Invalid username / 無効なユーザー名。")
+    return username
+
+
+def code_hash(code):
+    return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+
+
+def initialize():
+    with database() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invitations (
+                id TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL UNIQUE,
+                max_uses INTEGER NOT NULL CHECK(max_uses > 0),
+                uses INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL,
+                created_by TEXT NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS timers (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                parent_id TEXT REFERENCES timers(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                starts_at TEXT NOT NULL,
+                ends_at TEXT NOT NULL,
+                duration_unit TEXT NOT NULL,
+                duration_value INTEGER NOT NULL,
+                until_date TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS timers_user_start
+            ON timers(user_id, starts_at);
+
+            CREATE TABLE IF NOT EXISTS journals (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                timer_id TEXT REFERENCES timers(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS journals_user_created
+            ON journals(user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS attachments (
+                id TEXT PRIMARY KEY,
+                journal_id TEXT NOT NULL REFERENCES journals(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                content BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_failures (
+                username TEXT PRIMARY KEY,
+                failures INTEGER NOT NULL,
+                blocked_until REAL NOT NULL DEFAULT 0
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO users
+            (id, username, password_hash, is_admin, must_change_password, created_at)
+            VALUES (?, ?, ?, 1, 1, ?)
+            """,
+            (
+                identifier(),
+                "timer-admin",
+                password_hash(
+                    os.environ.get("TIMER_ADMIN_INITIAL_PASSWORD", "tadmin123@")
+                ),
+                stamp(),
+            ),
+        )
+
+
+def rows(query, parameters=()):
+    with database() as connection:
+        return [
+            dict(row)
+            for row in connection.execute(query, parameters).fetchall()
+        ]
+
+
+def current_user():
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        return None
+    result = rows("SELECT * FROM users WHERE id = ?", (user_id,))
+    return result[0] if result else None
+
+
+def authenticate(username, password):
+    key = username.strip().casefold()
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        failure = connection.execute(
+            "SELECT * FROM auth_failures WHERE username = ?", (key,)
+        ).fetchone()
+        if failure and failure["blocked_until"] > time.time():
+            return None, "Too many attempts. Try again later / しばらくして再試行してください。"
+
+        user = connection.execute(
+            "SELECT * FROM users WHERE username = ?", (username.strip(),)
+        ).fetchone()
+        if user:
+            valid = password_matches(password, user["password_hash"])
+        else:
+            hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), DUMMY_SALT, PASSWORD_ROUNDS
+            )
+            valid = False
+
+        if not valid:
+            count = (failure["failures"] if failure else 0) + 1
+            blocked_until = time.time() + 900 if count >= 5 else 0
+            connection.execute(
+                """
+                INSERT INTO auth_failures(username, failures, blocked_until)
+                VALUES (?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    failures = excluded.failures,
+                    blocked_until = excluded.blocked_until
+                """,
+                (key, 0 if blocked_until else count, blocked_until),
+            )
+            return None, "Invalid username or password / ログイン情報が違います。"
+
+        connection.execute("DELETE FROM auth_failures WHERE username = ?", (key,))
+        return dict(user), None
+
+
+def register(username, password, invitation):
+    username = validate_username(username)
+    validate_password(password)
+    hashed_password = password_hash(password)
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        invite = connection.execute(
+            "SELECT * FROM invitations WHERE code_hash = ?",
+            (code_hash(invitation),),
+        ).fetchone()
+        if (
+            not invite
+            or invite["revoked"]
+            or invite["uses"] >= invite["max_uses"]
+            or parse_stamp(invite["expires_at"]) <= utc_now()
+        ):
+            raise ValueError("Invalid or expired invitation / 招待コードが無効または期限切れです。")
+        connection.execute(
+            """
+            INSERT INTO users(id, username, password_hash, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (identifier(), username, hashed_password, stamp()),
+        )
+        connection.execute(
+            "UPDATE invitations SET uses = uses + 1 WHERE id = ?", (invite["id"],)
+        )
+
+
+def auth_screen():
+    st.title("Timers & Journal / タイマーと日記")
+    login_tab, registration_tab = st.tabs(["Login / ログイン", "Register / 新規登録"])
+    with login_tab:
+        with st.form("login"):
+            username = st.text_input("Username / ユーザー名")
+            password = st.text_input("Password / パスワード", type="password")
+            submitted = st.form_submit_button("Login / ログイン", type="primary")
+        if submitted:
+            user, error = authenticate(username, password)
+            if error:
+                st.error(error)
+            else:
+                st.session_state.clear()
+                st.session_state.user_id = user["id"]
+                st.rerun()
+
+    with registration_tab:
+        with st.form("register"):
+            username = st.text_input("Username / ユーザー名", key="register_username")
+            password = st.text_input(
+                "Password / パスワード", type="password", key="register_password"
+            )
+            repeated = st.text_input("Repeat password / 確認", type="password")
+            invitation = st.text_input("Invitation code / 招待コード")
+            submitted = st.form_submit_button("Create account / 登録")
+        if submitted:
+            try:
+                if password != repeated:
+                    raise ValueError("Passwords do not match / パスワードが一致しません。")
+                register(username, password, invitation)
+                st.success("Account created. Please log in / 登録完了。ログインしてください。")
+            except sqlite3.IntegrityError:
+                st.error("Username already exists / ユーザー名は使用済みです。")
+            except ValueError as error:
+                st.error(str(error))
+
+
+def account_settings(user):
+    with st.form("change_password"):
+        old = st.text_input("Current password / 現在のパスワード", type="password")
+        new = st.text_input("New password / 新しいパスワード", type="password")
+        repeated = st.text_input("Repeat new password / 確認", type="password")
+        submitted = st.form_submit_button("Change password / パスワード変更")
+    if submitted:
+        try:
+            if not password_matches(old, user["password_hash"]):
+                raise ValueError("Current password is incorrect / 現在のパスワードが違います。")
+            validate_password(new)
+            if new != repeated:
+                raise ValueError("Passwords do not match / パスワードが一致しません。")
+            if password_matches(new, user["password_hash"]):
+                raise ValueError("Choose a different password / 別のパスワードを設定してください。")
+            with database() as connection:
+                connection.execute(
+                    """
+                    UPDATE users SET password_hash = ?, must_change_password = 0
+                    WHERE id = ?
+                    """,
+                    (password_hash(new), user["id"]),
+                )
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
+
+def user_timers(user_id):
+    return rows(
+        "SELECT * FROM timers WHERE user_id = ? ORDER BY starts_at DESC",
+        (user_id,),
+    )
+
+
+def timer_status(timer):
+    now = utc_now()
+    if now < parse_stamp(timer["starts_at"]):
+        return "Future / 予定"
+    if now >= parse_stamp(timer["ends_at"]):
+        return "Past / 終了"
+    return "Current / 進行中"
+
+
+def timer_label(timer):
+    return (
+        f"{timer['title']} · {local_text(timer['starts_at'])}"
+        f" · {timer['id'][:8]}"
+    )
+
+
+def calculate_end(start, unit, amount, until_text):
+    if unit == "until":
+        chosen_date = datetime.strptime(until_text.strip(), "%Y%m%d").date()
+        # Include the entire selected day in Japan time.
+        return datetime.combine(
+            chosen_date + timedelta(days=1), datetime_time.min, JST
+        ).astimezone(UTC)
+    if amount < 1:
+        raise ValueError("Duration must be positive / 期間は1以上にしてください。")
+    if unit in {"hours", "days", "weeks"}:
+        return start + timedelta(**{unit: amount})
+    local_start = start.astimezone(JST)
+    return (local_start + relativedelta(**{unit: amount})).astimezone(UTC)
+
+
+def validate_parent(connection, user_id, parent_id, timer_id=None):
+    visited = set()
+    cursor = parent_id
+    while cursor:
+        if cursor == timer_id or cursor in visited:
+            raise ValueError("Parent relationship would create a cycle / 親子関係が循環します。")
+        visited.add(cursor)
+        parent = connection.execute(
+            "SELECT parent_id FROM timers WHERE id = ? AND user_id = ?",
+            (cursor, user_id),
+        ).fetchone()
+        if not parent:
+            raise ValueError("Parent timer not found / 親タイマーが見つかりません。")
+        cursor = parent["parent_id"]
+
+
+def timer_editor(user):
+    notice = st.session_state.pop("timer_save_notice", None)
+    if notice:
+        st.success(notice)
+    modes = ["New / 新規", "Reuse template / 再利用", "Edit / 編集"]
+    tabs = st.tabs(modes)
+    for tab, mode in zip(tabs, modes):
+        with tab:
+            _timer_editor_content(user, mode)
+
+
+def _timer_editor_content(user, mode):
+    timers = user_timers(user["id"])
+    by_id = {timer["id"]: timer for timer in timers}
+    selected = None
+    if mode != "New / 新規":
+        if not timers:
+            st.info("Create a timer first / 先にタイマーを作成してください。")
+            return
+        selected_id = st.selectbox(
+            "Saved timer / 保存済みタイマー",
+            list(by_id),
+            format_func=lambda value: timer_label(by_id[value]),
+            key=f"timer_source_{mode}",
+        )
+        selected = by_id[selected_id]
+
+    editing = mode == "Edit / 編集"
+    source = selected or {}
+    form_key = f"timer_{mode}_{source.get('id', 'new')}"
+    default_start = (
+        parse_stamp(source["starts_at"]).astimezone(JST)
+        if editing
+        else utc_now().astimezone(JST)
+    )
+    parent_options = [None] + [
+        timer["id"] for timer in timers if not editing or timer["id"] != source["id"]
+    ]
+    default_parent = source.get("parent_id")
+    if default_parent not in parent_options:
+        default_parent = None
+
+    with st.form(form_key):
+        title = st.text_input("Title / タイトル", value=source.get("title", ""))
+        description = st.text_area(
+            "Description / 説明", value=source.get("description", "")
+        )
+        parent_id = st.selectbox(
+            "Parent timer / 親タイマー",
+            parent_options,
+            index=parent_options.index(default_parent),
+            format_func=lambda value: (
+                "None / なし" if value is None else timer_label(by_id[value])
+            ),
+        )
+        left, right = st.columns(2)
+        start_date = left.date_input(
+            "Start date (JST) / 開始日",
+            value=default_start.date(),
+            min_value=date(1900, 1, 1),
+            max_value=date(9998, 12, 31),
+        )
+        start_time = right.time_input(
+            "Start time (JST) / 開始時刻",
+            value=default_start.time().replace(tzinfo=None, microsecond=0),
+        )
+        unit = st.selectbox(
+            "Duration type / 期間の単位",
+            UNITS,
+            index=UNITS.index(source.get("duration_unit", "days")),
+            format_func=lambda value: UNIT_LABELS[value],
+        )
+        amount = st.number_input(
+            "Duration amount (ignored for Until) / 期間",
+            min_value=1,
+            max_value=1_000_000,
+            value=max(1, source.get("duration_value", 1)),
+            step=1,
+        )
+        until_text = st.text_input(
+            "Until YYYYMMDD (inclusive, JST) / 指定日（当日末まで）",
+            value=source.get("until_date") or default_start.strftime("%Y%m%d"),
+        )
+        st.caption(
+            "Every saved timer is reusable. Reuse creates one new timer, not its "
+            "children. Parent links organize timers; they do not schedule, stop, "
+            "or constrain child timers. Months and years use calendar arithmetic."
+            "\n\n"
+            "保存済みタイマーはすべて再利用できます。子タイマーは複製されません。"
+            "親子関係は整理用です。子の開始・終了は独立しています。月・年は暦で計算します。"
+        )
+        submitted = st.form_submit_button("Save timer / 保存", type="primary")
+
+    if submitted:
+        try:
+            if not title.strip():
+                raise ValueError("Title is required / タイトルを入力してください。")
+            start = datetime.combine(start_date, start_time, JST).astimezone(UTC)
+            end = calculate_end(start, unit, int(amount), until_text)
+            if end <= start:
+                raise ValueError("End must be after start / 終了は開始より後にしてください。")
+            timer_id = source["id"] if editing else identifier()
+            with database() as connection:
+                validate_parent(connection, user["id"], parent_id, timer_id)
+                if editing:
+                    connection.execute(
+                        """
+                        UPDATE timers
+                        SET parent_id=?, title=?, description=?, starts_at=?,
+                            ends_at=?, duration_unit=?, duration_value=?, until_date=?
+                        WHERE id=? AND user_id=?
+                        """,
+                        (
+                            parent_id, title.strip(), description, stamp(start),
+                            stamp(end), unit, int(amount),
+                            until_text.strip() if unit == "until" else None,
+                            timer_id, user["id"],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO timers
+                        (id,user_id,parent_id,title,description,starts_at,ends_at,
+                         duration_unit,duration_value,until_date,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            timer_id, user["id"], parent_id, title.strip(),
+                            description, stamp(start), stamp(end), unit, int(amount),
+                            until_text.strip() if unit == "until" else None, stamp(),
+                        ),
+                    )
+            st.session_state["timer_save_notice"] = "Saved / 保存しました。"
+            st.rerun()
+        except (ValueError, OverflowError) as error:
+            st.error(f"Unable to save / 保存できません: {error}")
+
+
+def duration_text(seconds):
+    seconds = max(0, int(seconds))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+@st.fragment(run_every="1s")
+def timer_dashboard(user_id):
+    timers = user_timers(user_id)
+    status_filter = st.selectbox(
+        "Filter / 表示",
+        ["All / すべて", "Current / 進行中", "Future / 予定", "Past / 終了"],
+    )
+    by_id = {timer["id"]: timer for timer in timers}
+    visible = [
+        timer for timer in timers
+        if status_filter == "All / すべて" or timer_status(timer) == status_filter
+    ]
+    if not visible:
+        st.info("No timers / タイマーがありません。")
+        return
+
+    # A stable preorder keeps parents above children without recursive rendering.
+    children = {}
+    for timer in timers:
+        children.setdefault(timer["parent_id"], []).append(timer)
+
+    ordered = []
+    stack = [(timer, 0) for timer in reversed(children.get(None, []))]
+    visited = set()
+    while stack:
+        timer, depth = stack.pop()
+        if timer["id"] in visited:
+            continue
+        visited.add(timer["id"])
+        ordered.append((timer, depth))
+        stack.extend(
+            (child, depth + 1)
+            for child in reversed(children.get(timer["id"], []))
+        )
+
+    visible_ids = {timer["id"] for timer in visible}
+    for timer, depth in ordered:
+        if timer["id"] not in visible_ids:
+            continue
+        now = utc_now()
+        start, end = parse_stamp(timer["starts_at"]), parse_stamp(timer["ends_at"])
+        with st.container(border=True):
+            prefix = ("↳ " * min(depth, 6)) if depth else ""
+            st.subheader(f"{prefix}{timer['title']}")
+            st.caption(timer_status(timer))
+            if timer["parent_id"] in by_id:
+                st.caption(f"Parent / 親: {by_id[timer['parent_id']]['title']}")
+            if timer["description"]:
+                st.text(timer["description"])
+            st.caption(
+                f"{local_text(timer['starts_at'])} → {local_text(timer['ends_at'])}"
+            )
+            if now < start:
+                st.metric("Starts in / 開始まで", duration_text((start - now).total_seconds()))
+            elif now < end:
+                st.metric("Remaining / 残り", duration_text((end - now).total_seconds()))
+            else:
+                st.metric("Finished ago / 終了から", duration_text((now - end).total_seconds()))
+            progress = (now - start).total_seconds() / (end - start).total_seconds()
+            st.progress(min(1.0, max(0.0, progress)))
+
+
+def journal_page(user):
+    timers = user_timers(user["id"])
+    timer_map = {timer["id"]: timer for timer in timers}
+    with st.expander("Write a journal / 日記を書く"):
+        with st.form("journal_create", clear_on_submit=True):
+            title = st.text_input("Post title / 記事タイトル")
+            body = st.text_area("Article / 本文", height=220)
+            timer_id = st.selectbox(
+                "Linked timer / 関連タイマー",
+                [None] + list(timer_map),
+                format_func=lambda value: (
+                    "None / なし"
+                    if value is None
+                    else f"{timer_status(timer_map[value])} · {timer_label(timer_map[value])}"
+                ),
+            )
+            uploads = st.file_uploader(
+                "Images or files / 画像・ファイル",
+                accept_multiple_files=True,
+                help="10 MB per file; 30 MB per post / 1ファイル10MB、記事合計30MB",
+            )
+            submitted = st.form_submit_button("Publish / 投稿", type="primary")
+        if submitted:
+            try:
+                if not title.strip() or not body.strip():
+                    raise ValueError("Title and article are required / タイトルと本文が必要です。")
+                if any(upload.size > MAX_FILE_BYTES for upload in uploads):
+                    raise ValueError("A file exceeds 10 MB / 10MBを超えるファイルがあります。")
+                if sum(upload.size for upload in uploads) > MAX_POST_BYTES:
+                    raise ValueError("Attachments exceed 30 MB / 添付合計が30MBを超えています。")
+                post_id = identifier()
+                with database() as connection:
+                    if timer_id and not connection.execute(
+                        "SELECT 1 FROM timers WHERE id=? AND user_id=?",
+                        (timer_id, user["id"]),
+                    ).fetchone():
+                        raise ValueError("Timer not found / タイマーがありません。")
+                    connection.execute(
+                        """
+                        INSERT INTO journals
+                        (id,user_id,timer_id,title,body,created_at) VALUES (?,?,?,?,?,?)
+                        """,
+                        (post_id, user["id"], timer_id, title.strip(), body, stamp()),
+                    )
+                    for upload in uploads:
+                        connection.execute(
+                            "INSERT INTO attachments VALUES (?,?,?,?,?)",
+                            (
+                                identifier(), post_id,
+                                Path(upload.name.replace("\\", "/")).name,
+                                upload.type or "application/octet-stream",
+                                upload.getvalue(),
+                            ),
+                        )
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+
+    selected_timer = st.selectbox(
+        "Filter articles by timer / タイマーで絞り込み",
+        ["all", "unlinked"] + list(timer_map),
+        format_func=lambda value: (
+            "All articles / 全記事" if value == "all"
+            else "Unlinked / 関連なし" if value == "unlinked"
+            else timer_label(timer_map[value])
+        ),
+    )
+    where = "j.user_id = ?"
+    parameters = [user["id"]]
+    if selected_timer == "unlinked":
+        where += " AND j.timer_id IS NULL"
+    elif selected_timer != "all":
+        where += " AND j.timer_id = ?"
+        parameters.append(selected_timer)
+
+    total = rows(
+        f"SELECT COUNT(*) AS n FROM journals j WHERE {where}", parameters
+    )[0]["n"]
+    pages = max(1, math.ceil(total / 20))
+    page = int(st.number_input(
+        "Page / ページ",
+        min_value=1,
+        max_value=pages,
+        value=1,
+        step=1,
+        key=f"journal_page_{selected_timer}_{pages}",
+    ))
+    st.caption(f"{total} posts · {page}/{pages} · 20 posts/page / 1ページ20記事")
+    articles = rows(
+        f"""
+        SELECT j.*, t.title AS timer_title
+        FROM journals j LEFT JOIN timers t ON t.id = j.timer_id
+        WHERE {where}
+        ORDER BY j.created_at DESC, j.id DESC LIMIT 20 OFFSET ?
+        """,
+        parameters + [(page - 1) * 20],
+    )
+    for article in articles:
+        with st.container(border=True):
+            st.subheader(article["title"])
+            st.caption(local_text(article["created_at"]))
+            if article["timer_title"]:
+                st.caption(f"Timer / タイマー: {article['timer_title']}")
+            st.text(article["body"])
+            attachments = rows(
+                """
+                SELECT id, filename, mime_type, length(content) AS bytes
+                FROM attachments WHERE journal_id = ?
+                """,
+                (article["id"],),
+            )
+            if attachments:
+                with st.expander(f"Attachments / 添付 ({len(attachments)})"):
+                    for attachment in attachments:
+                        content = rows(
+                            "SELECT content FROM attachments WHERE id = ?",
+                            (attachment["id"],),
+                        )[0]["content"]
+                        if attachment["mime_type"] in {
+                            "image/png", "image/jpeg", "image/webp", "image/gif"
+                        }:
+                            try:
+                                st.image(content, caption=attachment["filename"])
+                            except Exception:
+                                st.caption("Image preview unavailable / 画像を表示できません。")
+                        st.download_button(
+                            f"Download / 保存: {attachment['filename']}",
+                            data=content,
+                            file_name=attachment["filename"],
+                            mime="application/octet-stream",
+                            key=f"attachment_{attachment['id']}",
+                        )
+
+
+TIMER_FIELDS = [
+    "id", "parent_id", "title", "description", "starts_at", "ends_at",
+    "duration_unit", "duration_value", "until_date", "created_at",
+]
+JOURNAL_FIELDS = [
+    "id", "timer_id", "title", "body", "created_at", "attachments_json",
+]
+
+
+def make_csv(records, fields):
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(records)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def read_csv(upload, fields):
+    if not upload or upload.size > MAX_CSV_BYTES:
+        raise ValueError("Select a CSV file up to 50 MB / 50MB以下のCSVを選択してください。")
+    csv.field_size_limit(MAX_CSV_BYTES)
+    reader = csv.DictReader(
+        io.StringIO(upload.getvalue().decode("utf-8-sig"), newline="")
+    )
+    if not reader.fieldnames or not set(fields).issubset(reader.fieldnames):
+        raise ValueError("CSV columns do not match / CSVの列が一致しません。")
+    result = []
+    for record in reader:
+        result.append(record)
+        if len(result) > MAX_IMPORT_ROWS:
+            raise ValueError("Maximum 1,000 records per import / 1回の取込は1000件まで。")
+    ids = [record["id"] for record in result]
+    if any(not value for value in ids) or len(set(ids)) != len(ids):
+        raise ValueError("CSV IDs must be unique and nonempty / IDが空または重複しています。")
+    return result
+
+
+def import_timers(user_id, records):
+    mapping = {record["id"]: identifier() for record in records}
+    source = {record["id"]: record for record in records}
+
+    for record in records:
+        if not record["title"].strip():
+            raise ValueError("Timer title is required / タイトルがありません。")
+        if record["duration_unit"] not in UNITS:
+            raise ValueError("Invalid duration unit / 期間の単位が不正です。")
+        if int(record["duration_value"]) < 1:
+            raise ValueError("Invalid duration / 期間が不正です。")
+        if parse_stamp(record["ends_at"]) <= parse_stamp(record["starts_at"]):
+            raise ValueError("Invalid start/end / 開始・終了が不正です。")
+        parse_stamp(record["created_at"])
+        if record["duration_unit"] == "until":
+            datetime.strptime(record["until_date"], "%Y%m%d")
+        seen = {record["id"]}
+        parent = record["parent_id"]
+        while parent:
+            if parent not in source:
+                raise ValueError("Missing parent in CSV / CSVに親タイマーがありません。")
+            if parent in seen:
+                raise ValueError("Cyclic parent hierarchy / 親子関係が循環しています。")
+            seen.add(parent)
+            parent = source[parent]["parent_id"]
+
+    with database() as connection:
+        for record in records:
+            connection.execute(
+                """
+                INSERT INTO timers
+                (id,user_id,parent_id,title,description,starts_at,ends_at,
+                 duration_unit,duration_value,until_date,created_at)
+                VALUES (?,?,NULL,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    mapping[record["id"]], user_id, record["title"],
+                    record["description"], stamp(parse_stamp(record["starts_at"])),
+                    stamp(parse_stamp(record["ends_at"])), record["duration_unit"],
+                    int(record["duration_value"]), record["until_date"] or None,
+                    stamp(parse_stamp(record["created_at"])),
+                ),
+            )
+        for record in records:
+            if record["parent_id"]:
+                connection.execute(
+                    "UPDATE timers SET parent_id = ? WHERE id = ?",
+                    (mapping[record["parent_id"]], mapping[record["id"]]),
+                )
+    return mapping
+
+
+def import_journals(user_id, records, mapping):
+    own_ids = {timer["id"] for timer in user_timers(user_id)}
+    with database() as connection:
+        for record in records:
+            if not record["title"].strip() or not record["body"].strip():
+                raise ValueError("Journal title/body required / 記事タイトル・本文が必要です。")
+            linked = record["timer_id"]
+            target = mapping.get(linked, linked) if linked else None
+            if target and target not in own_ids:
+                raise ValueError(
+                    "Linked timer not found. Import its timer CSV first in this session, "
+                    "or clear timer_id / 関連タイマーCSVを同じセッションで先に取り込んでください。"
+                )
+            attachments = json.loads(record["attachments_json"] or "[]")
+            if not isinstance(attachments, list):
+                raise ValueError("Invalid attachments / 添付データが不正です。")
+            decoded = []
+            total_bytes = 0
+            for attachment in attachments:
+                content = base64.b64decode(attachment["base64"], validate=True)
+                total_bytes += len(content)
+                if len(content) > MAX_FILE_BYTES or total_bytes > MAX_POST_BYTES:
+                    raise ValueError("Attachment limit exceeded / 添付容量を超えています。")
+                decoded.append((
+                    Path(str(attachment["filename"]).replace("\\", "/")).name or "file",
+                    str(attachment.get("mime_type") or "application/octet-stream"),
+                    content,
+                ))
+            post_id = identifier()
+            connection.execute(
+                "INSERT INTO journals VALUES (?,?,?,?,?,?)",
+                (
+                    post_id, user_id, target, record["title"], record["body"],
+                    stamp(parse_stamp(record["created_at"])),
+                ),
+            )
+            for filename, mime_type, content in decoded:
+                connection.execute(
+                    "INSERT INTO attachments VALUES (?,?,?,?,?)",
+                    (identifier(), post_id, filename, mime_type, content),
+                )
+
+
+def data_page(user):
+    st.subheader("CSV import / export · CSV入出力")
+    st.caption(
+        "Exports contain private text and file contents. Keep them secure. "
+        "Imports always create copies. For a full restore: import timers first, "
+        "then journals during the same login session. Parent IDs and journal "
+        "links are remapped. Import only trusted CSVs; exported text is preserved "
+        "verbatim and spreadsheet applications may interpret formulas."
+        "\n\n"
+        "CSVには個人情報と添付ファイルが含まれます。取込は常に新規作成です。"
+        "全体復元は同じログイン中にタイマー→日記の順で実行してください。"
+        "Excel等では数式として解釈される文字列に注意してください。"
+    )
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Timers / タイマー")
+        st.download_button(
+            "Export timer CSV / タイマーCSV出力",
+            make_csv(user_timers(user["id"]), TIMER_FIELDS),
+            file_name="timers.csv",
+            mime="text/csv",
+        )
+        upload = st.file_uploader("Timer CSV / タイマーCSV", type=["csv"])
+        if st.button("Import timers / タイマー取込"):
+            try:
+                records = read_csv(upload, TIMER_FIELDS)
+                mapping = import_timers(user["id"], records)
+                existing = st.session_state.setdefault("timer_import_mapping", {})
+                existing.update(mapping)
+                st.success(f"Imported / 取込完了: {len(records)}")
+            except (ValueError, KeyError, TypeError, OverflowError, csv.Error) as error:
+                st.error(f"Import failed; nothing imported / 取込失敗: {error}")
+
+    with right:
+        st.markdown("### Journals / 日記")
+        if st.button("Prepare journal export / 日記CSVを準備"):
+            articles = rows(
+                "SELECT * FROM journals WHERE user_id=? ORDER BY created_at",
+                (user["id"],),
+            )
+            for article in articles:
+                attachments = rows(
+                    "SELECT filename,mime_type,content FROM attachments WHERE journal_id=?",
+                    (article["id"],),
+                )
+                article["attachments_json"] = json.dumps(
+                    [
+                        {
+                            "filename": attachment["filename"],
+                            "mime_type": attachment["mime_type"],
+                            "base64": base64.b64encode(attachment["content"]).decode("ascii"),
+                        }
+                        for attachment in attachments
+                    ],
+                    ensure_ascii=False,
+                )
+            st.session_state.journal_export = make_csv(articles, JOURNAL_FIELDS)
+        if "journal_export" in st.session_state:
+            st.download_button(
+                "Download journal CSV / 日記CSV出力",
+                st.session_state.journal_export,
+                file_name="journals.csv",
+                mime="text/csv",
+            )
+            st.caption("Prepared snapshot; prepare again after new posts / 投稿後は再準備してください。")
+        journal_upload = st.file_uploader(
+            "Journal CSV / 日記CSV", type=["csv"], key="journal_csv"
+        )
+        if st.button("Import journals / 日記取込"):
+            try:
+                records = read_csv(journal_upload, JOURNAL_FIELDS)
+                import_journals(
+                    user["id"], records,
+                    st.session_state.get("timer_import_mapping", {}),
+                )
+                st.success(f"Imported / 取込完了: {len(records)}")
+            except (
+                ValueError, KeyError, TypeError, OverflowError, csv.Error,
+                sqlite3.IntegrityError,
+            ) as error:
+                st.error(f"Import failed; nothing imported / 取込失敗: {error}")
+
+
+def admin_page(user):
+    # Recheck authorization at the operation boundary.
+    authorized = rows(
+        "SELECT is_admin FROM users WHERE id=?", (user["id"],)
+    )
+    if not authorized or not authorized[0]["is_admin"]:
+        st.error("Administrator access required / 管理者権限が必要です。")
+        return
+
+    st.subheader("Invitations / 招待コード")
+    with st.form("issue_invitation"):
+        max_uses = st.number_input("Maximum uses / 使用可能回数", 1, 10000, 1)
+        expiry_days = st.number_input("Expires in days / 有効日数", 1, 3650, 7)
+        submitted = st.form_submit_button("Issue invitation / 招待コード発行")
+    if submitted:
+        code = secrets.token_urlsafe(24)
+        with database() as connection:
+            connection.execute(
+                """
+                INSERT INTO invitations
+                (id,code_hash,max_uses,uses,expires_at,created_by,created_at,revoked)
+                VALUES (?,?,?,0,?,?,?,0)
+                """,
+                (
+                    identifier(), code_hash(code), int(max_uses),
+                    stamp(utc_now() + timedelta(days=int(expiry_days))),
+                    user["id"], stamp(),
+                ),
+            )
+        st.session_state.new_invitation_code = code
+    if st.session_state.get("new_invitation_code"):
+        st.info("Copy this code now; only its hash is stored / コードを控えてください。")
+        st.code(st.session_state.new_invitation_code, language=None)
+        if st.button("Hide code / コードを非表示"):
+            del st.session_state.new_invitation_code
+            st.rerun()
+
+    invitations = rows(
+        """
+        SELECT id,max_uses,uses,expires_at,revoked,created_at
+        FROM invitations ORDER BY created_at DESC
+        """
+    )
+    if invitations:
+        st.dataframe(invitations, hide_index=True, use_container_width=True)
+        choices = [invite["id"] for invite in invitations if not invite["revoked"]]
+        if choices:
+            selected = st.selectbox("Invitation to revoke / 無効にする招待ID", choices)
+            if st.button("Revoke selected invitation / 選択した招待を無効化"):
+                with database() as connection:
+                    connection.execute(
+                        "UPDATE invitations SET revoked=1 WHERE id=?", (selected,)
+                    )
+                st.rerun()
+
+    st.subheader("Create user / ユーザー作成")
+    with st.form("admin_create_user"):
+        username = st.text_input("Username / ユーザー名", key="admin_username")
+        password = st.text_input("Temporary password / 仮パスワード", type="password")
+        submitted = st.form_submit_button("Create user / 作成")
+    if submitted:
+        try:
+            username = validate_username(username)
+            validate_password(password)
+            with database() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO users
+                    (id,username,password_hash,is_admin,must_change_password,created_at)
+                    VALUES (?,?,?,0,1,?)
+                    """,
+                    (identifier(), username, password_hash(password), stamp()),
+                )
+            st.success("User created; password change required at login / 作成しました。初回変更必須です。")
+        except sqlite3.IntegrityError:
+            st.error("Username already exists / ユーザー名は使用済みです。")
+        except ValueError as error:
+            st.error(str(error))
+
+    st.subheader("Users / ユーザー一覧")
+    st.dataframe(
+        rows(
+            """
+            SELECT username,is_admin,must_change_password,created_at
+            FROM users ORDER BY created_at
+            """
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def main():
+    initialize()
+    user = current_user()
+    if not user:
+        auth_screen()
+        return
+
+    with st.sidebar:
+        st.title("Timers & Journal")
+        st.write(user["username"])
+        st.caption("Timezone / タイムゾーン: Asia/Tokyo")
+        if st.button("Logout / ログアウト"):
+            st.session_state.clear()
+            st.rerun()
+
+    if user["must_change_password"]:
+        st.title("Set a new password / パスワードを変更してください")
+        st.warning("Change your temporary password before continuing / 続行前に仮パスワードを変更してください。")
+        account_settings(user)
+        return
+
+    # Native navigation uses links and highlights the active page.
+    # Callable pages preserve the authenticated Streamlit session.
+    def render_timers():
+        st.title("Timers / タイマー")
+        st.caption(
+            "Countdowns are calculated from persisted timestamps. They stay accurate "
+            "when the browser is closed; this app does not send background alarms."
+            "\n\n"
+            "保存された日時から残り時間を計算します。ブラウザを閉じても継続します。"
+            "バックグラウンド通知・アラームはありません。"
+        )
+        timer_dashboard(user["id"])
+
+    def render_editor():
+        st.title("Create & edit / タイマー作成・編集")
+        timer_editor(user)
+
+    def render_journal():
+        st.title("Journal / 日記")
+        journal_page(user)
+
+    def render_csv():
+        data_page(user)
+
+    def render_account():
+        st.title("Account / アカウント")
+        account_settings(user)
+
+    def render_admin():
+        st.title("Administration / 管理")
+        admin_page(user)
+
+    pages = [
+        st.Page(
+            render_timers,
+            title="Timers / タイマー",
+            url_path="timers",
+            default=True,
+        ),
+        st.Page(
+            render_editor,
+            title="Create & edit / 作成・編集",
+            url_path="timer-editor",
+        ),
+        st.Page(
+            render_journal,
+            title="Journal / 日記",
+            url_path="journal",
+        ),
+        st.Page(
+            render_csv,
+            title="CSV / 入出力",
+            url_path="csv",
+        ),
+        st.Page(
+            render_account,
+            title="Account / アカウント",
+            url_path="account",
+        ),
+    ]
+
+    if user["is_admin"]:
+        pages.append(
+            st.Page(
+                render_admin,
+                title="Admin / 管理",
+                url_path="admin",
+            )
+        )
+
+    navigation = st.navigation(pages, position="hidden")
+
+    with st.sidebar:
+        st.markdown("### Navigation / メニュー")
+        for page in pages:
+            st.page_link(page, use_container_width=True)
+
+    navigation.run()
+
+
+if __name__ == "__main__":
+    main()
