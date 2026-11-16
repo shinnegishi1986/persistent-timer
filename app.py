@@ -2757,6 +2757,8 @@ def _fixed_timer_statistics(timer, quit_record, now):
 
     payload = {
         "startMs": start.timestamp() * 1000,
+        "startsAtText": local_text(timer["starts_at"]),
+        "endsAtText": local_text(timer["ends_at"]),
         "endMs": end.timestamp() * 1000,
         "serverNowMs": now.timestamp() * 1000,
         "durationMs": total_seconds * 1000,
@@ -2813,6 +2815,11 @@ def _fixed_timer_statistics(timer, quit_record, now):
         line-height: 1.25;
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
+    }
+    .schedule-value {
+        font-size: 14px;
+        white-space: normal;
+        overflow-wrap: anywhere;
     }
     .progress {
         margin-top: 20px;
@@ -2911,6 +2918,14 @@ def _fixed_timer_statistics(timer, quit_record, now):
                 <div class="label">Duration / 予定期間</div>
                 <div class="value" id="duration">—</div>
             </div>
+            <div>
+                <div class="label">Started at / 開始日時</div>
+                <div class="value schedule-value" id="started-at">—</div>
+            </div>
+            <div>
+                <div class="label">Scheduled end / 終了予定日時</div>
+                <div class="value schedule-value" id="ended-at">—</div>
+            </div>
         </div>
         <div class="progress"
              id="progress"
@@ -2946,7 +2961,8 @@ const config = __SMOOTH_TIMER_CONFIGURATION__;
 const elements = {};
 for (const id of [
     "percentage", "elapsed", "remaining", "duration", "remaining-label",
-    "progress", "progress-fill", "note", "ring", "chart-percentage"
+    "progress", "progress-fill", "note", "ring", "chart-percentage",
+    "started-at", "ended-at"
 ]) {
     elements[id] = document.getElementById(id);
 }
@@ -2996,6 +3012,8 @@ function render() {
         ? "100.0%"
         : `${Math.min(fraction * 100, 99.9).toFixed(1)}%`;
 
+    setText("started-at", config.startsAtText);
+    setText("ended-at", config.endsAtText);
     setText("percentage", percentage);
     setText("chart-percentage", percentage);
     setText("elapsed", durationText(elapsed, false));
@@ -3069,7 +3087,7 @@ if (!frozen) requestAnimationFrame(animate);
         bar_color=visual_settings["bar_color"],
         donut_color=visual_settings["donut_color"],
         document=document,
-        height=310,
+        height=405,
         key=f"timer_theme_{timer['id']}",
         default=None,
     )
@@ -3158,6 +3176,12 @@ def timer_dashboard(user_id):
                 "Alarm / 終了音: "
                 + (sound[0]["title"] if sound else "Default / 標準")
             )
+
+            if st.button(
+                "Share / Embed · 共有・埋め込み",
+                key=f"_share_timer_{timer['id']}",
+            ):
+                timer_share_dialog(timer["id"])
 
             _fixed_timer_statistics(timer, quit_record, utc_now())
 
@@ -3338,9 +3362,301 @@ def load_timer_visual_preferences(timer_id, user_id):
     }
 
 
+
+# SHARE_AND_EMBED_TIMER_V1
+
+def initialize_timer_sharing():
+    with database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS timer_public_links (
+                timer_id TEXT PRIMARY KEY
+                    REFERENCES timers(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def timer_share_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def timer_share_base_url(value):
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(
+            "Enter the full deployed URL, including https://. "
+            "https:// を含むアプリURLを入力してください。"
+        )
+    if parsed.username or parsed.password:
+        raise ValueError("URLs must not contain credentials.")
+
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path or "/",
+        "",
+        "",
+    ))
+
+
+def create_timer_public_link(timer_id, user_id):
+    token = secrets.token_urlsafe(32)
+
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute(
+            "SELECT 1 FROM timers WHERE id=? AND user_id=?",
+            (timer_id, user_id),
+        ).fetchone():
+            raise ValueError("Timer not found / タイマーがありません。")
+
+        connection.execute(
+            """
+            INSERT INTO timer_public_links(timer_id,token_hash,created_at)
+            VALUES (?,?,?)
+            ON CONFLICT(timer_id) DO UPDATE SET
+                token_hash=excluded.token_hash,
+                created_at=excluded.created_at
+            """,
+            (timer_id, timer_share_hash(token), stamp()),
+        )
+
+    st.session_state[f"_timer_public_token_{timer_id}"] = token
+    return token
+
+
+def revoke_timer_public_link(timer_id, user_id):
+    with database() as connection:
+        connection.execute(
+            """
+            DELETE FROM timer_public_links
+            WHERE timer_id=? AND EXISTS (
+                SELECT 1 FROM timers
+                WHERE id=? AND user_id=?
+            )
+            """,
+            (timer_id, timer_id, user_id),
+        )
+    st.session_state.pop(f"_timer_public_token_{timer_id}", None)
+
+
+@st.dialog("Share / Embed · 共有・埋め込み")
+def timer_share_dialog(timer_id):
+    import html as share_html
+    from urllib.parse import urlencode
+
+    user = current_user()
+    if not user:
+        st.error("Please log in / ログインしてください。")
+        return
+
+    found = rows(
+        "SELECT title FROM timers WHERE id=? AND user_id=?",
+        (timer_id, user["id"]),
+    )
+    if not found:
+        st.error("Timer not found / タイマーがありません。")
+        return
+
+    st.text(found[0]["title"])
+    st.warning(
+        "Anyone with the link can view this timer's title, description, "
+        "schedule, progress, and quit status. "
+        "リンクを知っている人はタイトル・説明・日時・進捗・中断状態を閲覧できます。"
+    )
+
+    base_url = st.text_input(
+        "Deployed app URL / 公開アプリURL",
+        value=os.environ.get("TIMER_PUBLIC_BASE_URL", ""),
+        placeholder="https://your-app.streamlit.app/",
+        key=f"_timer_share_base_{timer_id}",
+    )
+
+    current_link = rows(
+        "SELECT token_hash FROM timer_public_links WHERE timer_id=?",
+        (timer_id,),
+    )
+
+    confirmed = st.checkbox(
+        "Allow public read-only access / 読み取り専用で公開する",
+        key=f"_timer_share_consent_{timer_id}",
+    )
+
+    if st.button(
+        "Create / replace link · リンクを発行・再発行",
+        disabled=not confirmed,
+        type="primary",
+        key=f"_timer_share_create_{timer_id}",
+    ):
+        try:
+            timer_share_base_url(base_url)
+            create_timer_public_link(timer_id, user["id"])
+            st.success(
+                "Link created. Any previous link is now invalid. "
+                "発行しました。以前のリンクは無効になります。"
+            )
+            current_link = rows(
+                "SELECT token_hash FROM timer_public_links WHERE timer_id=?",
+                (timer_id,),
+            )
+        except ValueError as error:
+            st.error(str(error))
+
+    token = st.session_state.get(f"_timer_public_token_{timer_id}")
+    usable_token = bool(
+        token
+        and current_link
+        and hmac.compare_digest(
+            timer_share_hash(token), current_link[0]["token_hash"]
+        )
+    )
+
+    if usable_token:
+        try:
+            base = timer_share_base_url(base_url)
+            share_url = base + "?" + urlencode({"timer_share": token})
+            embed_url = base + "?" + urlencode({
+                "timer_share": token,
+                "embed": "true",
+            })
+
+            st.caption("Share link / 共有リンク")
+            st.code(share_url, language=None)
+
+            iframe = (
+                '<iframe src="'
+                + share_html.escape(embed_url, quote=True)
+                + '" title="Shared timer" width="100%" height="500" '
+                  'style="border:0;border-radius:12px;" '
+                  'loading="lazy"></iframe>'
+            )
+            st.caption("Blog embed HTML / ブログ埋め込みHTML")
+            st.code(iframe, language="html")
+            st.caption(
+                "Save this URL now. It is not recoverable after this browser "
+                "session ends; you can issue a replacement instead. "
+                "URLを控えてください。セッション終了後は再発行が必要です。"
+            )
+        except ValueError as error:
+            st.info(str(error))
+    elif current_link:
+        st.info(
+            "A public link is active. Create a replacement to obtain a new URL. "
+            "公開リンクは有効です。URLが必要な場合は再発行してください。"
+        )
+
+    if current_link:
+        if st.button(
+            "Revoke public access / 公開を停止",
+            key=f"_timer_share_revoke_{timer_id}",
+        ):
+            revoke_timer_public_link(timer_id, user["id"])
+            st.rerun()
+
+    if st.button("Close / 閉じる", key=f"_timer_share_close_{timer_id}"):
+        st.rerun()
+
+
+@st.fragment(run_every="15s")
+def render_public_shared_timer(token):
+    # Check the database on EVERY refresh, not just initial page load.
+    result = rows(
+        """
+        SELECT t.*
+        FROM timer_public_links p
+        JOIN timers t ON t.id=p.timer_id
+        WHERE p.token_hash=?
+        """,
+        (timer_share_hash(token),),
+    )
+    if not result:
+        st.error(
+            "This timer link is invalid, revoked, or deleted. "
+            "リンクが無効、公開停止、または削除されています。"
+        )
+        return
+
+    timer = result[0]
+    quit_record = None
+    with database() as connection:
+        if connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='timer_quit_events'
+            """
+        ).fetchone():
+            record = connection.execute(
+                """
+                SELECT * FROM timer_quit_events
+                WHERE timer_id=? AND user_id=?
+                """,
+                (timer["id"], timer["user_id"]),
+            ).fetchone()
+            quit_record = dict(record) if record else None
+
+    with st.container(border=True):
+        st.subheader(timer["title"])
+        if timer["description"]:
+            st.text(timer["description"])
+
+        if quit_record:
+            st.caption("Quit / 中断: " + local_text(quit_record["quit_at"]))
+
+        # This renderer displays statistics only. It exposes no edit controls,
+        # file downloads, private audio, account information, or journal data.
+        _fixed_timer_statistics(timer, quit_record, utc_now())
+
+    st.caption("Read-only shared timer / 読み取り専用タイマー")
+
+
+def handle_public_timer_request():
+    token = st.query_params.get("timer_share")
+    if token is None:
+        return False
+
+    # Handle public requests before restoring cookies or showing login controls.
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if (
+        not isinstance(token, str)
+        or len(token) != 43
+        or any(
+            character not in
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for character in token
+        )
+    ):
+        st.error("Invalid timer link / 無効なタイマーリンクです。")
+        return True
+
+    # Public requests bypass the rest of main(), so initialize the table needed
+    # by the existing theme-aware statistics renderer here as well.
+    initialize_timer_visual_preferences()
+    render_public_shared_timer(token)
+    return True
+
+
 def main():
     apply_delete_timer_button_color()
     initialize()
+    initialize_timer_sharing()
+    if handle_public_timer_request():
+        return
     initialize_timer_visual_preferences()
     initialize_sound_preferences()
     initialize_quit_history()
