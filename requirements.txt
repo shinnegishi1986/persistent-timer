@@ -1,0 +1,7 @@
+# Timer application dependencies for Streamlit Community Cloud
+streamlit>=1.37
+streamlit-cookies-controller
+python-dateutil>=2.9
+pandas
+altair
+Pillow
