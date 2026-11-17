@@ -3441,6 +3441,8 @@ def initialize_timer_sharing():
             """
         )
 
+    initialize_always_valid_timer_links()
+
 
 def timer_share_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -3467,178 +3469,16 @@ def timer_share_base_url(value):
     ))
 
 
-def create_timer_public_link(timer_id, user_id):
-    token = secrets.token_urlsafe(32)
-
-    with database() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        if not connection.execute(
-            "SELECT 1 FROM timers WHERE id=? AND user_id=?",
-            (timer_id, user_id),
-        ).fetchone():
-            raise ValueError("Timer not found / タイマーがありません。")
-
-        connection.execute(
-            """
-            INSERT INTO timer_public_links(timer_id,token_hash,created_at)
-            VALUES (?,?,?)
-            ON CONFLICT(timer_id) DO UPDATE SET
-                token_hash=excluded.token_hash,
-                created_at=excluded.created_at
-            """,
-            (timer_id, timer_share_hash(token), stamp()),
-        )
-
-    st.session_state[f"_timer_public_token_{timer_id}"] = token
-    return token
 
 
-def revoke_timer_public_link(timer_id, user_id):
-    with database() as connection:
-        connection.execute(
-            """
-            DELETE FROM timer_public_links
-            WHERE timer_id=? AND EXISTS (
-                SELECT 1 FROM timers
-                WHERE id=? AND user_id=?
-            )
-            """,
-            (timer_id, timer_id, user_id),
-        )
-    st.session_state.pop(f"_timer_public_token_{timer_id}", None)
 
 
-@st.dialog("Share / Embed · 共有・埋め込み")
-def timer_share_dialog(timer_id):
-    import html as share_html
-    from urllib.parse import urlencode
-
-    user = current_user()
-    if not user:
-        st.error("Please log in / ログインしてください。")
-        return
-
-    found = rows(
-        "SELECT title FROM timers WHERE id=? AND user_id=?",
-        (timer_id, user["id"]),
-    )
-    if not found:
-        st.error("Timer not found / タイマーがありません。")
-        return
-
-    st.text(found[0]["title"])
-    st.warning(
-        "Anyone with the link can view this timer's title, description, "
-        "schedule, progress, and quit status. "
-        "リンクを知っている人はタイトル・説明・日時・進捗・中断状態を閲覧できます。"
-    )
-
-    try:
-        base_url = retrieve_timer_public_base_url()
-    except ValueError as error:
-        st.error(str(error))
-        return
-
-    current_link = rows(
-        "SELECT token_hash FROM timer_public_links WHERE timer_id=?",
-        (timer_id,),
-    )
-
-    confirmed = st.checkbox(
-        "Allow public read-only access / 読み取り専用で公開する",
-        key=f"_timer_share_consent_{timer_id}",
-    )
-
-    if st.button(
-        "Create / replace link · リンクを発行・再発行",
-        disabled=not confirmed,
-        type="primary",
-        key=f"_timer_share_create_{timer_id}",
-    ):
-        try:
-            timer_share_base_url(base_url)
-            create_timer_public_link(timer_id, user["id"])
-            st.success(
-                "Link created. Any previous link is now invalid. "
-                "発行しました。以前のリンクは無効になります。"
-            )
-            current_link = rows(
-                "SELECT token_hash FROM timer_public_links WHERE timer_id=?",
-                (timer_id,),
-            )
-        except ValueError as error:
-            st.error(str(error))
-
-    token = st.session_state.get(f"_timer_public_token_{timer_id}")
-    usable_token = bool(
-        token
-        and current_link
-        and hmac.compare_digest(
-            timer_share_hash(token), current_link[0]["token_hash"]
-        )
-    )
-
-    if usable_token:
-        try:
-            base = timer_share_base_url(base_url)
-            # PARAMETER_STYLE_TIMER_SHARING_RESTORED_V1
-            share_url = base + "?" + urlencode({
-                "timer_share": token,
-            })
-            embed_url = base + "?" + urlencode({
-                "timer_share": token,
-                "embed": "true",
-            })
-
-            st.caption("Share link / 共有リンク")
-            st.code(share_url, language=None)
-
-            iframe = (
-                '<iframe src="'
-                + share_html.escape(embed_url, quote=True)
-                + '" title="Shared timer" width="100%" height="500" '
-                  'style="border:0;border-radius:12px;" '
-                  'loading="lazy"></iframe>'
-            )
-            st.caption("Blog embed HTML / ブログ埋め込みHTML")
-            st.code(iframe, language="html")
-            st.caption(
-                "Save this URL now. It is not recoverable after this browser "
-                "session ends; you can issue a replacement instead. "
-                "URLを控えてください。セッション終了後は再発行が必要です。"
-            )
-        except ValueError as error:
-            st.info(str(error))
-    elif current_link:
-        st.info(
-            "A public link is active. Create a replacement to obtain a new URL. "
-            "公開リンクは有効です。URLが必要な場合は再発行してください。"
-        )
-
-    if current_link:
-        if st.button(
-            "Revoke public access / 公開を停止",
-            key=f"_timer_share_revoke_{timer_id}",
-        ):
-            revoke_timer_public_link(timer_id, user["id"])
-            st.rerun()
-
-    if st.button("Close / 閉じる", key=f"_timer_share_close_{timer_id}"):
-        st.rerun()
 
 
 @st.fragment
 def render_public_shared_timer(token):
     # Check the database on EVERY refresh, not just initial page load.
-    result = rows(
-        """
-        SELECT t.*
-        FROM timer_public_links p
-        JOIN timers t ON t.id=p.timer_id
-        WHERE p.token_hash=?
-        """,
-        (timer_share_hash(token),),
-    )
+    result = timer_link_lookup(token)
     if not result:
         st.error(
             "This timer link is invalid, revoked, or deleted. "
@@ -4461,21 +4301,6 @@ window.addEventListener("pagehide", function(event) {
 
 # SHARED_TIMER_THUMBNAIL_AND_VIDEOS_V1
 
-def shared_timer_media_access_allowed(token, timer_id):
-    """Revalidate the public capability; do not rely on login state."""
-    if not isinstance(token, str) or len(token) != 43:
-        return False
-
-    result = rows(
-        """
-        SELECT 1
-        FROM timer_public_links p
-        JOIN timers t ON t.id=p.timer_id
-        WHERE p.timer_id=? AND p.token_hash=?
-        """,
-        (timer_id, timer_share_hash(token)),
-    )
-    return bool(result)
 
 
 def render_shared_timer_thumbnail(token, timer):
@@ -4544,6 +4369,194 @@ def render_edit_timer_delete_action(timer_id, user_id):
         "A confirmation dialog opens before deletion. "
         "選択中の保存済みタイマーを削除します。削除前に確認画面を表示します。"
     )
+
+
+
+# ALWAYS_VALID_TIMER_SHARE_LINKS_V1
+
+def initialize_always_valid_timer_links():
+    with database() as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS timer_public_links_v2 (
+                id TEXT PRIMARY KEY,
+                timer_id TEXT NOT NULL REFERENCES timers(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS timer_public_links_v2_timer
+            ON timer_public_links_v2(timer_id);
+        """)
+        # This patch deliberately makes previously temporary saved links permanent.
+        connection.execute(
+            "UPDATE timer_public_links_v2 SET expires_at=NULL WHERE expires_at IS NOT NULL"
+        )
+
+
+def always_valid_token_from_input(value):
+    from urllib.parse import urlsplit, parse_qs
+    token = str(value or "").strip()
+    if "://" in token:
+        parsed = urlsplit(token)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("Use an HTTP(S) share URL or a token.")
+        tokens = parse_qs(parsed.query).get("timer_share", [])
+        if len(tokens) != 1:
+            raise ValueError("The URL must contain one timer_share parameter.")
+        token = tokens[0]
+    if (len(token) != 43 or any(c not in
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in token)):
+        raise ValueError("Invalid share token / 無効な共有トークンです。")
+    return token
+
+
+def timer_link_lookup(token):
+    try:
+        token = always_valid_token_from_input(token)
+    except (ValueError, TypeError):
+        return []
+    digest = timer_share_hash(token)
+    return rows(
+        "SELECT t.* FROM timer_public_links p JOIN timers t ON t.id=p.timer_id "
+        "WHERE p.token_hash=? UNION ALL "
+        "SELECT t.* FROM timer_public_links_v2 p JOIN timers t ON t.id=p.timer_id "
+        "WHERE p.token_hash=? LIMIT 1", (digest, digest),
+    )
+
+
+def save_always_valid_timer_link(timer_id, user_id, token):
+    token = always_valid_token_from_input(token)
+    digest = timer_share_hash(token)
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute(
+            "SELECT 1 FROM timers WHERE id=? AND user_id=?", (timer_id, user_id)
+        ).fetchone():
+            raise ValueError("Timer not found / タイマーがありません。")
+        for table in ("timer_public_links", "timer_public_links_v2"):
+            existing = connection.execute(
+                f"SELECT timer_id FROM {table} WHERE token_hash=?", (digest,)
+            ).fetchone()
+            if existing and existing["timer_id"] != timer_id:
+                raise ValueError("This link already belongs to another timer.")
+        connection.execute(
+            "INSERT INTO timer_public_links_v2 "
+            "(id,timer_id,token_hash,created_at,expires_at) VALUES (?,?,?,?,NULL) "
+            "ON CONFLICT(token_hash) DO UPDATE SET expires_at=NULL",
+            (identifier(), timer_id, digest, stamp()),
+        )
+    st.session_state[f"_timer_public_token_{timer_id}"] = token
+    return token
+
+
+def create_timer_public_link(timer_id, user_id, expires_at=None):
+    # Compatible signature; expiration is intentionally disabled by this patch.
+    return save_always_valid_timer_link(
+        timer_id, user_id, secrets.token_urlsafe(32)
+    )
+
+
+def shared_timer_media_access_allowed(token, timer_id):
+    result = timer_link_lookup(token)
+    return bool(result and result[0]["id"] == timer_id)
+
+
+def revoke_timer_public_link(timer_id, user_id):
+    # Explicit owner revocation remains available for privacy/security.
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute(
+            "SELECT 1 FROM timers WHERE id=? AND user_id=?", (timer_id, user_id)
+        ).fetchone():
+            raise ValueError("Timer not found / タイマーがありません。")
+        for table in ("timer_public_links", "timer_public_links_v2"):
+            connection.execute(f"DELETE FROM {table} WHERE timer_id=?", (timer_id,))
+    st.session_state.pop(f"_timer_public_token_{timer_id}", None)
+
+
+@st.dialog("Share / Embed · 共有・埋め込み")
+def timer_share_dialog(timer_id):
+    import html
+    from urllib.parse import urlencode
+    user = current_user()
+    if not user:
+        st.error("Please log in / ログインしてください。")
+        return
+    owned = rows("SELECT title FROM timers WHERE id=? AND user_id=?", (timer_id, user["id"]))
+    if not owned:
+        st.error("Timer not found / タイマーがありません。")
+        return
+    st.text(owned[0]["title"])
+    st.info(
+        "All saved share links have no expiry. Creating a new link does not "
+        "invalidate older saved links. No viewer login is required. "
+        "保存済み共有リンクは無期限です。新規発行しても以前のリンクは無効になりません。"
+    )
+    st.warning(
+        "Anyone who knows a valid link can view this timer and its thumbnail. "
+        "Do not share sensitive information. リンクを知っている人が閲覧できます。"
+    )
+    try:
+        base = timer_share_base_url(retrieve_timer_public_base_url())
+    except ValueError as error:
+        st.error(str(error))
+        return
+    consent = st.checkbox("Allow public access / 公開に同意する", key=f"_always_share_consent_{timer_id}")
+    if st.button("Create another permanent link / 無期限リンクを追加発行", disabled=not consent,
+                 type="primary", key=f"_always_share_create_{timer_id}"):
+        try:
+            create_timer_public_link(timer_id, user["id"])
+            st.success("Created. Previous saved links remain valid. / 既存リンクも引き続き有効です。")
+        except ValueError as error:
+            st.error(str(error))
+
+    with st.expander("Restore an old replaced link / 過去に置換されたリンクを復元"):
+        st.caption(
+            "Only restore a URL you originally issued for this selected timer. "
+            "The app cannot verify its historical timer association after the "
+            "old database record was overwritten. This intentionally reactivates "
+            "the pasted token, even if you previously revoked it."
+        )
+        old_url = st.text_input("Old URL or token / 古いURLまたはトークン", key=f"_always_share_old_{timer_id}")
+        confirm = st.checkbox(
+            "I confirm this old link belongs to this timer and may be public again",
+            key=f"_always_share_restore_confirm_{timer_id}",
+        )
+        if st.button("Restore this old link / この旧リンクを有効化", disabled=not (consent and confirm),
+                     key=f"_always_share_restore_{timer_id}"):
+            try:
+                save_always_valid_timer_link(timer_id, user["id"], old_url)
+                st.success("Restored / 復元しました。")
+            except ValueError as error:
+                st.error(str(error))
+
+    token = st.session_state.get(f"_timer_public_token_{timer_id}")
+    result = timer_link_lookup(token) if token else []
+    if result and result[0]["id"] == timer_id:
+        st.caption("Most recently created/restored URL / 直近に発行・復元したURL")
+        st.code(base + "?" + urlencode({"timer_share": token}), language=None)
+        embed = base + "?" + urlencode({"timer_share": token, "embed": "true"})
+        st.code('<iframe src="' + html.escape(embed, quote=True)
+                + '" title="Shared timer" width="100%" height="900" '
+                + 'style="border:0;border-radius:12px" loading="lazy"></iframe>', language="html")
+        st.caption(
+            "Save the URL. Only its hash is stored; losing the URL display does "
+            "not expire it. URLを保存してください。画面から消えてもリンクは失効しません。"
+        )
+    total = rows(
+        "SELECT COUNT(DISTINCT token_hash) AS n FROM ("
+        "SELECT token_hash FROM timer_public_links WHERE timer_id=? UNION ALL "
+        "SELECT token_hash FROM timer_public_links_v2 WHERE timer_id=?)", (timer_id, timer_id)
+    )[0]["n"]
+    st.caption(f"Active permanent links / 有効な無期限リンク: {total}")
+    if total:
+        revoke = st.checkbox("Confirm revoking all links / 全リンク無効化を確認", key=f"_always_revoke_confirm_{timer_id}")
+        if st.button("Revoke all links / 全リンクを無効化", disabled=not revoke, key=f"_always_revoke_{timer_id}"):
+            revoke_timer_public_link(timer_id, user["id"])
+            st.rerun(scope="fragment")
+    st.caption("Links require the app, database, and deployed URL to remain available.")
+    if st.button("Close / 閉じる", key=f"_always_close_{timer_id}"):
+        st.rerun()
 
 
 def main():
