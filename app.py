@@ -3471,7 +3471,7 @@ def timer_share_dialog(timer_id):
     )
 
     try:
-        base_url = timer_path_public_base_url()
+        base_url = retrieve_timer_public_base_url()
     except ValueError as error:
         st.error(str(error))
         return
@@ -3518,8 +3518,14 @@ def timer_share_dialog(timer_id):
     if usable_token:
         try:
             base = timer_share_base_url(base_url)
-            share_url = base.rstrip("/") + "/timer/" + token
-            embed_url = share_url
+            # PARAMETER_STYLE_TIMER_SHARING_RESTORED_V1
+            share_url = base + "?" + urlencode({
+                "timer_share": token,
+            })
+            embed_url = base + "?" + urlencode({
+                "timer_share": token,
+                "embed": "true",
+            })
 
             st.caption("Share link / 共有リンク")
             st.code(share_url, language=None)
