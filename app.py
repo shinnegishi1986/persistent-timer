@@ -3693,14 +3693,11 @@ def retrieve_timer_public_base_url():
 # PATH_BASED_TIMER_SHARING_V1
 
 def timer_path_public_base_url():
-    value = os.environ.get("TIMER_PUBLIC_BASE_URL", "").strip()
-    if not value:
-        raise ValueError(
-            "Set TIMER_PUBLIC_BASE_URL to the host serving public_timer_server.py. "
-            "Path-based links require the separate public timer service. "
-            "公開タイマーサーバーのURLを TIMER_PUBLIC_BASE_URL に設定してください。"
-        )
-    return timer_share_base_url(value).rstrip("/")
+    # AUTOMATIC_PATH_SHARE_BASE_URL_V1
+    # The existing detector supports an optional canonical URL override,
+    # otherwise derives the app entry URL from st.context.url.
+    base = retrieve_timer_public_base_url()
+    return timer_share_base_url(base).rstrip("/")
 
 
 def main():
