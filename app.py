@@ -3255,11 +3255,7 @@ def timer_dashboard(user_id):
             elif callable(globals().get("quit_timer_controls")):
                 quit_timer_controls(timer, user_id)
 
-            if st.button(
-                "Delete timer / タイマーを削除",
-                key=f"_fixed_delete_timer_{timer['id']}",
-            ):
-                _fixed_delete_timer_dialog(timer["id"])
+            pass  # Timer deletion is managed outside the dashboard.
 
     if shown == 0:
         st.info("No matching timers / 該当するタイマーはありません。")
@@ -4629,3 +4625,5 @@ if __name__ == "__main__":
     main()
 
 # TIMER_DASHBOARD_THUMBNAIL_MANAGE_BUTTON_REMOVED_V1
+
+# TIMER_DASHBOARD_DELETE_BUTTON_REMOVED_V1
