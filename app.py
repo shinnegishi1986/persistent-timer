@@ -539,6 +539,11 @@ def journal_page(user):
                 accept_multiple_files=True,
                 help="10 MB per file; 30 MB per post / 1ファイル10MB、記事合計30MB",
             )
+            new_journal_videos = st.file_uploader(
+                "Videos / 動画（MP4・WEBM、複数可）",
+                type=["mp4", "webm"],
+                accept_multiple_files=True,
+            )
             submitted = st.form_submit_button("Publish / 投稿", type="primary")
         if submitted:
             try:
@@ -548,6 +553,9 @@ def journal_page(user):
                     raise ValueError("A file exceeds 10 MB / 10MBを超えるファイルがあります。")
                 if sum(upload.size for upload in uploads) > MAX_POST_BYTES:
                     raise ValueError("Attachments exceed 30 MB / 添付合計が30MBを超えています。")
+                prepared_journal_videos = media_prepare_videos(
+                    new_journal_videos
+                )
                 post_id = identifier()
                 with database() as connection:
                     if timer_id and not connection.execute(
@@ -572,6 +580,10 @@ def journal_page(user):
                                 upload.getvalue(),
                             ),
                         )
+                    media_insert_videos(
+                        connection, "journal", post_id, user["id"],
+                        prepared_journal_videos,
+                    )
                 st.session_state["_journal_form_epoch"] = (
                     st.session_state.get("_journal_form_epoch", 0) + 1
                 )
@@ -626,6 +638,12 @@ def journal_page(user):
             if article["timer_title"]:
                 st.caption(f"Timer / タイマー: {article['timer_title']}")
             st.text(article["body"])
+            media_render_videos("journal", article["id"], user["id"])
+            if st.button(
+                "Manage videos / 動画管理",
+                key=f"journal_media_manage_{article['id']}",
+            ):
+                media_manage_dialog("journal", article["id"])
             if st.button(
                 "Delete article / 記事を削除",
                 key=f"delete_article_{article['id']}",
@@ -2472,6 +2490,45 @@ def _timer_editor_content(user, mode):
         "色はタイマーを保存すると反映されます。"
     )
 
+
+    with st.expander("Thumbnail & videos / サムネイル・動画"):
+        if editing:
+            media_render_thumbnail(edit_target_id, user["id"])
+            if st.button(
+                "Manage saved media / 保存済みメディアを管理",
+                key=f"{prefix}_manage_media",
+            ):
+                media_manage_dialog("timer", edit_target_id)
+
+        new_thumbnail = st.file_uploader(
+            "Thumbnail / サムネイル（任意）",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"{prefix}_thumbnail",
+        )
+        if new_thumbnail:
+            st.image(new_thumbnail.getvalue(), caption="Preview / プレビュー")
+
+        remove_thumbnail = (
+            st.checkbox(
+                "Remove saved thumbnail / 保存済み画像を削除",
+                key=f"{prefix}_remove_thumbnail",
+            )
+            if editing else False
+        )
+
+        new_timer_videos = st.file_uploader(
+            "Add videos / 動画追加（MP4・WEBM、複数可）",
+            type=["mp4", "webm"],
+            accept_multiple_files=True,
+            key=f"{prefix}_videos",
+        )
+        st.caption(
+            "New uploads are saved with the timer. "
+            "Reuse does not copy the template's existing media. "
+            "新規アップロードはタイマー保存時に登録します。"
+            "再利用では元のメディアは複製されません。"
+        )
+
     parent_options = [None] + [
         timer_id for timer_id in by_id if timer_id != edit_target_id
     ]
@@ -2573,6 +2630,8 @@ def _timer_editor_content(user, mode):
         if end <= start:
             raise ValueError("End must follow start / 終了は開始より後にしてください。")
 
+        prepared_thumbnail = media_prepare_thumbnail(new_thumbnail)
+        prepared_timer_videos = media_prepare_videos(new_timer_videos)
         timer_id = edit_target_id if editing else identifier()
 
         # Timer data and sound assignment are saved in ONE transaction.
@@ -2643,6 +2702,15 @@ def _timer_editor_content(user, mode):
                     timer_visual_color(chosen_donut_color),
                     int(chosen_same_color),
                 ),
+            )
+
+            media_save_thumbnail(
+                connection, timer_id, user["id"],
+                prepared_thumbnail, remove=remove_thumbnail,
+            )
+            media_insert_videos(
+                connection, "timer", timer_id, user["id"],
+                prepared_timer_videos,
             )
 
         if creating:
@@ -3152,6 +3220,7 @@ def timer_dashboard(user_id):
         with st.container(border=True):
             prefix = "↳ " * min(depth, 5)
             st.subheader(prefix + timer["title"])
+            media_render_thumbnail(timer["id"], user_id)
             st.caption(f"{status} · ID: {timer['id']}")
             if timer.get("parent_id") in by_id:
                 st.caption(
@@ -3184,6 +3253,12 @@ def timer_dashboard(user_id):
                 timer_share_dialog(timer["id"])
 
             _fixed_timer_statistics(timer, quit_record, utc_now())
+            media_render_videos("timer", timer["id"], user_id)
+            if st.button(
+                "Manage media / メディア管理",
+                key=f"timer_media_manage_{timer['id']}",
+            ):
+                media_manage_dialog("timer", timer["id"])
 
             if quit_record:
                 st.caption("Quit / 中断: " + local_text(quit_record["quit_at"]))
@@ -3706,9 +3781,548 @@ def timer_path_public_base_url():
     return timer_share_base_url(base).rstrip("/")
 
 
+
+# THUMBNAIL_AND_VIDEO_SUPPORT_V1
+
+MEDIA_THUMBNAIL_LIMIT = 10 * 1024 * 1024
+MEDIA_VIDEO_LIMIT = 100 * 1024 * 1024
+MEDIA_BATCH_LIMIT = 500 * 1024 * 1024
+
+
+def initialize_thumbnail_video_support():
+    with database() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS timer_thumbnails (
+                timer_id TEXT PRIMARY KEY
+                    REFERENCES timers(id) ON DELETE CASCADE,
+                mime_type TEXT NOT NULL,
+                content BLOB NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS record_videos (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                timer_id TEXT REFERENCES timers(id) ON DELETE CASCADE,
+                journal_id TEXT REFERENCES journals(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                content BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (
+                    (timer_id IS NOT NULL AND journal_id IS NULL)
+                    OR
+                    (timer_id IS NULL AND journal_id IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS videos_timer ON record_videos(timer_id);
+            CREATE INDEX IF NOT EXISTS videos_journal ON record_videos(journal_id);
+            """
+        )
+
+
+def media_record_column(kind):
+    if kind == "timer":
+        return "timer_id", "timers"
+    if kind == "journal":
+        return "journal_id", "journals"
+    raise ValueError("Invalid media record type.")
+
+
+def media_require_owner(connection, kind, record_id, user_id):
+    _, table = media_record_column(kind)
+    if not connection.execute(
+        f"SELECT 1 FROM {table} WHERE id=? AND user_id=?",
+        (record_id, user_id),
+    ).fetchone():
+        raise ValueError("Record not found / 対象がありません。")
+
+
+def media_prepare_thumbnail(upload):
+    import io as media_io
+    import warnings
+    from PIL import Image, ImageOps
+
+    if upload is None:
+        return None
+    if not 0 < upload.size <= MEDIA_THUMBNAIL_LIMIT:
+        raise ValueError("Thumbnail must be at most 10 MiB / 画像は10MiB以下です。")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(media_io.BytesIO(upload.getvalue())) as source:
+                # Reject oversized images before decoding/resizing.
+                if source.width * source.height > 24_000_000:
+                    raise ValueError("Image exceeds 24 megapixels / 画像が大きすぎます。")
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                image.thumbnail((1600, 1000))
+                output = media_io.BytesIO()
+                image.save(output, format="JPEG", quality=88, optimize=True)
+                return output.getvalue()
+    except Exception as error:
+        raise ValueError(
+            "Cannot process thumbnail / 画像を処理できません。"
+        ) from error
+
+
+def media_prepare_videos(uploads):
+    prepared = []
+    total = 0
+    for upload in uploads or []:
+        filename = Path(upload.name.replace("\\", "/")).name
+        extension = Path(filename).suffix.lower()
+        if extension not in {".mp4", ".webm"}:
+            raise ValueError("Only MP4 / WEBM videos are supported.")
+        if not 0 < upload.size <= MEDIA_VIDEO_LIMIT:
+            raise ValueError(
+                "Each video must be at most 100 MiB / 動画は1本100MiB以下です。"
+            )
+        total += upload.size
+        if total > MEDIA_BATCH_LIMIT:
+            raise ValueError(
+                "New videos exceed 500 MiB per save / 1回の保存は合計500MiB以下です。"
+            )
+        prepared.append({
+            "filename": filename,
+            "title": Path(filename).stem[:200] or "Video",
+            "mime_type": "video/mp4" if extension == ".mp4" else "video/webm",
+            "content": upload.getvalue(),
+        })
+    return prepared
+
+
+def media_insert_videos(connection, kind, record_id, user_id, prepared):
+    column, _ = media_record_column(kind)
+    media_require_owner(connection, kind, record_id, user_id)
+    for video in prepared:
+        now = stamp()
+        connection.execute(
+            f"""
+            INSERT INTO record_videos
+            (id,user_id,{column},title,description,filename,mime_type,
+             content,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                identifier(), user_id, record_id, video["title"], "",
+                video["filename"], video["mime_type"], video["content"],
+                now, now,
+            ),
+        )
+
+
+def media_save_thumbnail(connection, timer_id, user_id, content, remove=False):
+    media_require_owner(connection, "timer", timer_id, user_id)
+    if remove:
+        connection.execute(
+            "DELETE FROM timer_thumbnails WHERE timer_id=?", (timer_id,)
+        )
+    if content is not None:
+        connection.execute(
+            """
+            INSERT INTO timer_thumbnails(timer_id,mime_type,content,updated_at)
+            VALUES (?,'image/jpeg',?,?)
+            ON CONFLICT(timer_id) DO UPDATE SET
+                mime_type=excluded.mime_type,
+                content=excluded.content,
+                updated_at=excluded.updated_at
+            """,
+            (timer_id, content, stamp()),
+        )
+
+
+def media_render_thumbnail(timer_id, user_id):
+    import base64 as media_base64
+
+    result = rows(
+        """
+        SELECT p.content
+        FROM timer_thumbnails p JOIN timers t ON t.id=p.timer_id
+        WHERE t.id=? AND t.user_id=?
+        """,
+        (timer_id, user_id),
+    )
+    if not result:
+        return
+
+    encoded = media_base64.b64encode(result[0]["content"]).decode("ascii")
+    st.markdown(
+        '<div style="position:relative;margin:8px 0 18px;border-radius:16px;'
+        'overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.15);">'
+        '<img alt="Timer thumbnail" src="data:image/jpeg;base64,'
+        + encoded
+        + '" style="display:block;width:100%;height:clamp(150px,24vw,290px);'
+          'object-fit:cover;object-position:center;">'
+          '<div style="position:absolute;inset:0;pointer-events:none;'
+          'background:linear-gradient(180deg,transparent 55%,rgba(0,0,0,.18));">'
+          '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def media_video_list(kind, record_id, user_id):
+    column, table = media_record_column(kind)
+    return rows(
+        f"""
+        SELECT v.id,v.title,v.description,v.filename,v.mime_type,
+               length(v.content) AS bytes,v.updated_at
+        FROM record_videos v
+        JOIN {table} r ON r.id=v.{column}
+        WHERE v.{column}=? AND v.user_id=? AND r.user_id=?
+        ORDER BY v.created_at,v.id
+        """,
+        (record_id, user_id, user_id),
+    )
+
+
+def media_video_content(video_id, user_id):
+    result = rows(
+        "SELECT content FROM record_videos WHERE id=? AND user_id=?",
+        (video_id, user_id),
+    )
+    return result[0]["content"] if result else None
+
+
+def media_render_videos(kind, record_id, user_id):
+    videos = media_video_list(kind, record_id, user_id)
+    if not videos:
+        return
+
+    with st.expander(f"Videos / 動画 ({len(videos)})"):
+        options = {video["id"]: video for video in videos}
+        key = f"media_play_{kind}_{record_id}"
+        if key in st.session_state and st.session_state[key] not in options:
+            del st.session_state[key]
+        selected = st.selectbox(
+            "Choose a video / 動画を選択",
+            list(options),
+            format_func=lambda value: options[value]["title"],
+            key=key,
+        )
+        video = options[selected]
+        if video["description"]:
+            st.text(video["description"])
+        content = media_video_content(selected, user_id)
+        if content is not None:
+            media_play_blob_video(content, video["mime_type"])
+
+
+@st.dialog("Manage media / メディア管理", width="large")
+def media_manage_dialog(kind, record_id):
+    user = current_user()
+    if not user:
+        st.error("Please log in / ログインしてください。")
+        return
+    try:
+        with database() as connection:
+            media_require_owner(connection, kind, record_id, user["id"])
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    prefix = f"media_manage_{kind}_{record_id}"
+
+    if kind == "timer":
+        st.subheader("Thumbnail / サムネイル")
+        media_render_thumbnail(record_id, user["id"])
+        replacement = st.file_uploader(
+            "Upload / replace thumbnail · 画像登録・差替え",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"{prefix}_thumbnail",
+        )
+        if replacement:
+            st.image(replacement.getvalue(), caption="Preview / プレビュー")
+        if st.button("Save thumbnail / 画像を保存", key=f"{prefix}_save_thumbnail"):
+            try:
+                content = media_prepare_thumbnail(replacement)
+                if content is None:
+                    raise ValueError("Choose an image / 画像を選択してください。")
+                with database() as connection:
+                    media_save_thumbnail(
+                        connection, record_id, user["id"], content
+                    )
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+
+        delete_thumbnail = st.checkbox(
+            "Confirm thumbnail deletion / 画像削除を確認",
+            key=f"{prefix}_confirm_thumbnail",
+        )
+        if st.button(
+            "Delete thumbnail / 画像を削除",
+            disabled=not delete_thumbnail,
+            key=f"{prefix}_delete_thumbnail",
+        ):
+            with database() as connection:
+                media_save_thumbnail(
+                    connection, record_id, user["id"], None, remove=True
+                )
+            st.rerun()
+
+    st.subheader("Videos / 動画")
+    uploads = st.file_uploader(
+        "Add videos / 動画を追加（複数可）",
+        type=["mp4", "webm"],
+        accept_multiple_files=True,
+        key=f"{prefix}_add_videos",
+    )
+    if st.button("Upload videos / 動画を保存", key=f"{prefix}_save_videos"):
+        try:
+            prepared = media_prepare_videos(uploads)
+            if not prepared:
+                raise ValueError("Choose videos / 動画を選択してください。")
+            with database() as connection:
+                media_insert_videos(
+                    connection, kind, record_id, user["id"], prepared
+                )
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
+    videos = media_video_list(kind, record_id, user["id"])
+    if videos:
+        options = {video["id"]: video for video in videos}
+        selected = st.selectbox(
+            "Edit video / 動画を編集",
+            list(options),
+            format_func=lambda value: options[value]["title"],
+            key=f"{prefix}_edit_selection",
+        )
+        video = options[selected]
+        content = media_video_content(selected, user["id"])
+        if content is not None:
+            media_play_blob_video(content, video["mime_type"])
+
+        updated_file = st.file_uploader(
+            "Replace video file (optional) / 動画差替え（任意）",
+            type=["mp4", "webm"],
+            key=f"{prefix}_{selected}_replace",
+        )
+        with st.form(f"{prefix}_{selected}_edit"):
+            title = st.text_input(
+                "Video title / 動画タイトル", value=video["title"], max_chars=200
+            )
+            description = st.text_area(
+                "Description / 説明", value=video["description"], max_chars=10000
+            )
+            save = st.form_submit_button("Update video / 動画を更新")
+
+        if save:
+            try:
+                if not title.strip():
+                    raise ValueError("Title is required / タイトルが必要です。")
+                replacement = (
+                    media_prepare_videos([updated_file])[0]
+                    if updated_file else None
+                )
+                with database() as connection:
+                    media_require_owner(
+                        connection, kind, record_id, user["id"]
+                    )
+                    column, _ = media_record_column(kind)
+                    if replacement:
+                        connection.execute(
+                            f"""
+                            UPDATE record_videos
+                            SET title=?,description=?,filename=?,mime_type=?,
+                                content=?,updated_at=?
+                            WHERE id=? AND user_id=? AND {column}=?
+                            """,
+                            (
+                                title.strip(), description,
+                                replacement["filename"], replacement["mime_type"],
+                                replacement["content"], stamp(),
+                                selected, user["id"], record_id,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            f"""
+                            UPDATE record_videos
+                            SET title=?,description=?,updated_at=?
+                            WHERE id=? AND user_id=? AND {column}=?
+                            """,
+                            (
+                                title.strip(), description, stamp(),
+                                selected, user["id"], record_id,
+                            ),
+                        )
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+
+        confirmed = st.checkbox(
+            "Confirm video deletion / 動画削除を確認",
+            key=f"{prefix}_{selected}_confirm_delete",
+        )
+        if st.button(
+            "Delete video / 動画を削除",
+            disabled=not confirmed,
+            key=f"{prefix}_{selected}_delete",
+        ):
+            with database() as connection:
+                media_require_owner(connection, kind, record_id, user["id"])
+                column, _ = media_record_column(kind)
+                connection.execute(
+                    f"DELETE FROM record_videos "
+                    f"WHERE id=? AND user_id=? AND {column}=?",
+                    (selected, user["id"], record_id),
+                )
+            st.rerun()
+
+    if st.button("Close / 閉じる", key=f"{prefix}_close"):
+        st.rerun()
+
+
+
+# IN_APP_BLOB_VIDEO_PLAYER_V1
+
+def media_play_blob_video(content, mime_type):
+    """Play a database BLOB without exposing a download control."""
+    import base64 as video_base64
+    import json as video_json
+    import streamlit.components.v1 as video_components
+
+    if mime_type not in {"video/mp4", "video/webm"}:
+        st.error("Unsupported video format / 未対応の動画形式です。")
+        return
+    if not content:
+        st.info("Video is empty / 動画データがありません。")
+        return
+
+    payload = video_json.dumps({
+        "mime": mime_type,
+        "base64": video_base64.b64encode(bytes(content)).decode("ascii"),
+    })
+
+    document = r"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: system-ui, sans-serif;
+    }
+    .video-shell {
+        width: 100%;
+        height: 385px;
+        overflow: hidden;
+        border-radius: 14px;
+        background: #080B10;
+        box-shadow: 0 6px 20px rgba(0,0,0,.14);
+    }
+    video {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #080B10;
+    }
+    #message {
+        margin: 8px 0 0;
+        color: #64748B;
+        font-size: 12px;
+        line-height: 1.5;
+    }
+    @media (prefers-color-scheme: dark) {
+        #message { color: #CBD5E1; }
+    }
+    @media (max-width: 500px) {
+        .video-shell { height: 280px; }
+    }
+</style>
+</head>
+<body>
+<div class="video-shell">
+    <video
+        id="player"
+        controls
+        playsinline
+        preload="metadata"
+        controlslist="nodownload noremoteplayback"
+        disablepictureinpicture
+        disableremoteplayback
+        aria-label="Video player / 動画プレイヤー">
+    </video>
+</div>
+<p id="message"></p>
+<script>
+"use strict";
+const payload = __VIDEO_PAYLOAD__;
+const player = document.getElementById("player");
+const message = document.getElementById("message");
+let objectUrl = null;
+
+function releaseVideo() {
+    if (objectUrl !== null) {
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = null;
+    }
+}
+
+player.addEventListener("contextmenu", event => event.preventDefault());
+
+player.addEventListener("error", () => {
+    message.textContent =
+        "Playback is unavailable. The browser may not support this video's codec. "
+        + "ブラウザが動画コーデックに対応していない可能性があります。";
+});
+
+try {
+    const binary = atob(payload.base64);
+    const chunks = [];
+    const chunkSize = 1024 * 1024;
+
+    for (let offset = 0; offset < binary.length; offset += chunkSize) {
+        const length = Math.min(chunkSize, binary.length - offset);
+        const bytes = new Uint8Array(length);
+        for (let index = 0; index < length; index++) {
+            bytes[index] = binary.charCodeAt(offset + index);
+        }
+        chunks.push(bytes);
+    }
+
+    const blob = new Blob(chunks, {type: payload.mime});
+    objectUrl = URL.createObjectURL(blob);
+    player.src = objectUrl;
+    player.load();
+
+    // Drop the encoded copy once the browser Blob has been created.
+    payload.base64 = "";
+} catch (error) {
+    message.textContent =
+        "Cannot load video / 動画を読み込めません。";
+}
+
+window.addEventListener("pagehide", releaseVideo);
+window.addEventListener("beforeunload", releaseVideo);
+</script>
+</body>
+</html>
+"""
+    document = document.replace("__VIDEO_PAYLOAD__", payload)
+    video_components.html(document, height=430, scrolling=False)
+
+
 def main():
     apply_delete_timer_button_color()
     initialize()
+    initialize_thumbnail_video_support()
     initialize_timer_sharing()
     if handle_public_timer_request():
         return
