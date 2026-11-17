@@ -3246,11 +3246,7 @@ def timer_dashboard(user_id):
 
             _fixed_timer_statistics(timer, quit_record, utc_now())
             media_render_videos("timer", timer["id"], user_id)
-            if st.button(
-                "Manage thumbnail / サムネイル管理",
-                key=f"timer_media_manage_{timer['id']}",
-            ):
-                media_manage_dialog("timer", timer["id"])
+            pass  # Thumbnail management remains in Create & Edit.
 
             if quit_record:
                 st.caption("Quit / 中断: " + local_text(quit_record["quit_at"]))
@@ -4631,3 +4627,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# TIMER_DASHBOARD_THUMBNAIL_MANAGE_BUTTON_REMOVED_V1
