@@ -2491,11 +2491,11 @@ def _timer_editor_content(user, mode):
     )
 
 
-    with st.expander("Thumbnail & videos / サムネイル・動画"):
+    with st.expander("Thumbnail / サムネイル"):
         if editing:
             media_render_thumbnail(edit_target_id, user["id"])
             if st.button(
-                "Manage saved media / 保存済みメディアを管理",
+                "Manage thumbnail / サムネイルを管理",
                 key=f"{prefix}_manage_media",
             ):
                 media_manage_dialog("timer", edit_target_id)
@@ -2516,12 +2516,7 @@ def _timer_editor_content(user, mode):
             if editing else False
         )
 
-        new_timer_videos = st.file_uploader(
-            "Add videos / 動画追加（MP4・WEBM、複数可）",
-            type=["mp4", "webm"],
-            accept_multiple_files=True,
-            key=f"{prefix}_videos",
-        )
+        new_timer_videos = []
         st.caption(
             "New uploads are saved with the timer. "
             "Reuse does not copy the template's existing media. "
@@ -2631,7 +2626,7 @@ def _timer_editor_content(user, mode):
             raise ValueError("End must follow start / 終了は開始より後にしてください。")
 
         prepared_thumbnail = media_prepare_thumbnail(new_thumbnail)
-        prepared_timer_videos = media_prepare_videos(new_timer_videos)
+        prepared_timer_videos = []
         timer_id = edit_target_id if editing else identifier()
 
         # Timer data and sound assignment are saved in ONE transaction.
@@ -2708,10 +2703,7 @@ def _timer_editor_content(user, mode):
                 connection, timer_id, user["id"],
                 prepared_thumbnail, remove=remove_thumbnail,
             )
-            media_insert_videos(
-                connection, "timer", timer_id, user["id"],
-                prepared_timer_videos,
-            )
+            pass  # Timer videos disabled.
 
         if creating:
             st.session_state["_fixed_new_timer_epoch"] = epoch + 1
@@ -3255,7 +3247,7 @@ def timer_dashboard(user_id):
             _fixed_timer_statistics(timer, quit_record, utc_now())
             media_render_videos("timer", timer["id"], user_id)
             if st.button(
-                "Manage media / メディア管理",
+                "Manage thumbnail / サムネイル管理",
                 key=f"timer_media_manage_{timer['id']}",
             ):
                 media_manage_dialog("timer", timer["id"])
@@ -3901,6 +3893,10 @@ def media_prepare_videos(uploads):
 
 
 def media_insert_videos(connection, kind, record_id, user_id, prepared):
+    if kind == "timer":
+        if prepared:
+            raise ValueError("Timer videos have been disabled.")
+        return
     column, _ = media_record_column(kind)
     media_require_owner(connection, kind, record_id, user_id)
     for video in prepared:
@@ -3970,6 +3966,8 @@ def media_render_thumbnail(timer_id, user_id):
 
 
 def media_video_list(kind, record_id, user_id):
+    if kind == "timer":
+        return []
     column, table = media_record_column(kind)
     return rows(
         f"""
@@ -3986,13 +3984,15 @@ def media_video_list(kind, record_id, user_id):
 
 def media_video_content(video_id, user_id):
     result = rows(
-        "SELECT content FROM record_videos WHERE id=? AND user_id=?",
+        "SELECT content FROM record_videos WHERE id=? AND user_id=? AND timer_id IS NULL",
         (video_id, user_id),
     )
     return result[0]["content"] if result else None
 
 
 def media_render_videos(kind, record_id, user_id):
+    if kind == "timer":
+        return
     videos = media_video_list(kind, record_id, user_id)
     if not videos:
         return
@@ -4068,6 +4068,11 @@ def media_manage_dialog(kind, record_id):
                     connection, record_id, user["id"], None, remove=True
                 )
             st.rerun()
+
+    if kind == "timer":
+        if st.button("Close / 閉じる", key=f"{prefix}_thumbnail_close"):
+            st.rerun()
+        return
 
     st.subheader("Videos / 動画")
     uploads = st.file_uploader(
@@ -4487,13 +4492,11 @@ def render_shared_timer_thumbnail(token, timer):
 
 
 def render_shared_timer_videos(token, timer):
-    if not shared_timer_media_access_allowed(token, timer["id"]):
-        return
+    """Timer videos are disabled, including public shares/embeds."""
+    return
 
-    # This renderer exposes playback only, not the authenticated media manager.
-    # Only videos attached directly to this timer are selected.
-    media_render_videos("timer", timer["id"], timer["user_id"])
 
+# TIMER_VIDEO_FEATURE_REMOVED_V1
 
 def main():
     apply_delete_timer_button_color()
