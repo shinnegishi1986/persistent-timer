@@ -3639,7 +3639,7 @@ def timer_share_dialog(timer_id):
         st.rerun()
 
 
-@st.fragment(run_every="15s")
+@st.fragment
 def render_public_shared_timer(token):
     # Check the database on EVERY refresh, not just initial page load.
     result = rows(
@@ -4187,11 +4187,94 @@ def media_manage_dialog(kind, record_id):
 
 # IN_APP_BLOB_VIDEO_PLAYER_V1
 
+
+# IPAD_TOUCH_VIDEO_SUPPORT_V1
+
+@st.cache_data(ttl=3600, max_entries=4, show_spinner=False)
+def ipad_prepare_video(content, mime_type):
+    """Return playback bytes, MIME type, and an optional diagnostic."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    original = bytes(content)
+    enabled = os.environ.get("TIMER_VIDEO_TRANSCODE", "1").lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return original, mime_type, ""
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return original, mime_type, (
+            "FFmpeg is not installed on the app server. "
+            "If playback fails, upload H.264/AAC MP4 or install FFmpeg. "
+            "再生できない場合はH.264/AAC形式のMP4を使用してください。"
+        )
+
+    suffix = ".webm" if mime_type == "video/webm" else ".mp4"
+    try:
+        with tempfile.TemporaryDirectory(prefix="timer-ipad-video-") as folder:
+            source = Path(folder) / ("input" + suffix)
+            output = Path(folder) / "playback.mp4"
+            source.write_bytes(original)
+
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-y", "-i", str(source),
+                    "-map", "0:v:0",
+                    "-map", "0:a:0?",
+                    "-map_metadata", "-1",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-vf",
+                    "scale=1280:1280:force_original_aspect_ratio=decrease:"
+                    "force_divisible_by=2,setsar=1",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-ac", "2",
+                    "-movflags", "+faststart",
+                    str(output),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=180,
+                check=False,
+            )
+
+            if (
+                result.returncode == 0
+                and output.exists()
+                and output.stat().st_size > 0
+            ):
+                return output.read_bytes(), "video/mp4", ""
+
+            return original, mime_type, (
+                "Compatibility conversion failed; trying the original video. "
+                "The server needs FFmpeg with libx264 and AAC support."
+            )
+
+    except subprocess.TimeoutExpired:
+        return original, mime_type, (
+            "Compatibility conversion timed out; trying the original video. "
+            "Try a shorter H.264/AAC MP4."
+        )
+    except OSError:
+        return original, mime_type, (
+            "Compatibility conversion is unavailable; "
+            "trying the original video."
+        )
+
+
 def media_play_blob_video(content, mime_type):
-    """Play a database BLOB without exposing a download control."""
-    import base64 as video_base64
-    import json as video_json
-    import streamlit.components.v1 as video_components
+    """Touch-friendly playback of an authorized SQLite video BLOB."""
+    import base64
+    import json
+    import streamlit.components.v1 as components
 
     if mime_type not in {"video/mp4", "video/webm"}:
         st.error("Unsupported video format / 未対応の動画形式です。")
@@ -4200,9 +4283,17 @@ def media_play_blob_video(content, mime_type):
         st.info("Video is empty / 動画データがありません。")
         return
 
-    payload = video_json.dumps({
-        "mime": mime_type,
-        "base64": video_base64.b64encode(bytes(content)).decode("ascii"),
+    with st.spinner("Preparing video / 動画を準備しています…"):
+        playback, playback_mime, notice = ipad_prepare_video(
+            bytes(content), mime_type
+        )
+
+    if notice:
+        st.caption(notice)
+
+    payload = json.dumps({
+        "mime": playback_mime,
+        "data": base64.b64encode(playback).decode("ascii"),
     })
 
     document = r"""
@@ -4212,114 +4303,158 @@ def media_play_blob_video(content, mime_type):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-    html, body {
-        margin: 0;
-        padding: 0;
-        background: transparent;
-        font-family: system-ui, sans-serif;
-    }
-    .video-shell {
-        width: 100%;
-        height: 385px;
-        overflow: hidden;
-        border-radius: 14px;
-        background: #080B10;
-        box-shadow: 0 6px 20px rgba(0,0,0,.14);
-    }
-    video {
-        display: block;
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        background: #080B10;
-    }
-    #message {
-        margin: 8px 0 0;
-        color: #64748B;
-        font-size: 12px;
-        line-height: 1.5;
-    }
-    @media (prefers-color-scheme: dark) {
-        #message { color: #CBD5E1; }
-    }
-    @media (max-width: 500px) {
-        .video-shell { height: 280px; }
-    }
+html,body {
+    margin:0; padding:0; background:transparent;
+    font-family:system-ui,sans-serif;
+}
+video {
+    display:block; width:100%; height:310px;
+    object-fit:contain; background:#080b10; border-radius:12px;
+}
+.actions { display:flex; gap:10px; margin-top:10px; }
+button {
+    min-height:48px; padding:10px 22px;
+    border:0; border-radius:10px;
+    background:#2563eb; color:white; font-size:16px;
+    cursor:pointer; touch-action:manipulation;
+}
+button:disabled { opacity:.55; cursor:default; }
+#message {
+    font-size:13px; line-height:1.5; margin:10px 0;
+    color:#64748b;
+}
+@media(prefers-color-scheme:dark) {
+    #message { color:#cbd5e1; }
+}
 </style>
 </head>
 <body>
-<div class="video-shell">
-    <video
-        id="player"
-        controls
-        playsinline
-        preload="metadata"
-        controlslist="nodownload noremoteplayback"
-        disablepictureinpicture
-        disableremoteplayback
-        aria-label="Video player / 動画プレイヤー">
-    </video>
+<video id="video"
+    controls
+    playsinline
+    webkit-playsinline
+    preload="metadata"
+    controlslist="nodownload noremoteplayback"
+    disablepictureinpicture
+    disableremoteplayback
+    aria-label="Video player">
+</video>
+<div class="actions">
+    <button id="play" type="button" disabled>Play / 再生</button>
+    <button id="pause" type="button" disabled>Pause / 一時停止</button>
 </div>
-<p id="message"></p>
+<p id="message" role="status">Preparing / 準備中…</p>
 <script>
 "use strict";
-const payload = __VIDEO_PAYLOAD__;
-const player = document.getElementById("player");
+const payload = __PAYLOAD__;
+const video = document.getElementById("video");
+const playButton = document.getElementById("play");
+const pauseButton = document.getElementById("pause");
 const message = document.getElementById("message");
 let objectUrl = null;
 
-function releaseVideo() {
-    if (objectUrl !== null) {
-        player.pause();
-        player.removeAttribute("src");
-        player.load();
-        URL.revokeObjectURL(objectUrl);
-        objectUrl = null;
+video.playsInline = true;
+
+video.addEventListener("contextmenu", function(event) {
+    event.preventDefault();
+});
+
+function reportPlayFailure(error) {
+    if (error && error.name === "NotAllowedError") {
+        message.textContent =
+            "Tap the video's native Play control. "
+            + "動画内の再生ボタンをタップしてください。";
+    } else {
+        message.textContent =
+            "Cannot play this video. Try H.264/AAC MP4. "
+            + "H.264/AAC形式のMP4を使用してください。";
     }
 }
 
-player.addEventListener("contextmenu", event => event.preventDefault());
+playButton.addEventListener("click", function() {
+    // Call play directly within the trusted tap/click handler.
+    // Do not await metadata, conversion, or network work first.
+    try {
+        const promise = video.play();
+        if (promise && typeof promise.catch === "function") {
+            promise.catch(reportPlayFailure);
+        }
+    } catch (error) {
+        reportPlayFailure(error);
+    }
+});
 
-player.addEventListener("error", () => {
+pauseButton.addEventListener("click", function() {
+    video.pause();
+});
+
+video.addEventListener("playing", function() {
+    message.textContent = "";
+});
+video.addEventListener("waiting", function() {
+    message.textContent = "Loading / 読み込み中…";
+});
+video.addEventListener("canplay", function() {
+    message.textContent = video.paused
+        ? "Tap Play / 再生をタップしてください。" : "";
+});
+video.addEventListener("error", function() {
+    const code = video.error ? video.error.code : "unknown";
     message.textContent =
-        "Playback is unavailable. The browser may not support this video's codec. "
-        + "ブラウザが動画コーデックに対応していない可能性があります。";
+        "Playback error (" + code + "). Use H.264/AAC MP4 "
+        + "or enable FFmpeg on the app server. "
+        + "対応形式への変換が必要な可能性があります。";
 });
 
 try {
-    const binary = atob(payload.base64);
+    const binary = atob(payload.data);
     const chunks = [];
     const chunkSize = 1024 * 1024;
-
     for (let offset = 0; offset < binary.length; offset += chunkSize) {
-        const length = Math.min(chunkSize, binary.length - offset);
-        const bytes = new Uint8Array(length);
-        for (let index = 0; index < length; index++) {
+        const size = Math.min(chunkSize, binary.length - offset);
+        const bytes = new Uint8Array(size);
+        for (let index = 0; index < size; index++) {
             bytes[index] = binary.charCodeAt(offset + index);
         }
         chunks.push(bytes);
     }
 
-    const blob = new Blob(chunks, {type: payload.mime});
+    const blob = new Blob(chunks, {type:payload.mime});
     objectUrl = URL.createObjectURL(blob);
-    player.src = objectUrl;
-    player.load();
+    video.src = objectUrl;
+    payload.data = "";
+    video.load();
 
-    // Drop the encoded copy once the browser Blob has been created.
-    payload.base64 = "";
+    // Enable immediately: some mobile browsers defer metadata until a tap.
+    playButton.disabled = false;
+    pauseButton.disabled = false;
+    message.textContent = "Tap Play / 再生をタップしてください。";
 } catch (error) {
     message.textContent =
-        "Cannot load video / 動画を読み込めません。";
+        "Cannot prepare video. Try a smaller MP4. "
+        + "より小さいMP4ファイルを使用してください。";
 }
 
-window.addEventListener("pagehide", releaseVideo);
-window.addEventListener("beforeunload", releaseVideo);
+window.addEventListener("pagehide", function(event) {
+    // Keep the URL alive when the page enters the browser's back/forward cache.
+    if (!event.persisted && objectUrl !== null) {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = null;
+    }
+});
 </script>
 </body>
 </html>
 """
-    document = document.replace("__VIDEO_PAYLOAD__", payload)
-    video_components.html(document, height=430, scrolling=False)
+    components.html(
+        document.replace("__PAYLOAD__", payload),
+        height=470,
+        scrolling=False,
+    )
+
 
 
 
