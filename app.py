@@ -3678,15 +3678,17 @@ def render_public_shared_timer(token):
 
     with st.container(border=True):
         st.subheader(timer["title"])
+        render_shared_timer_thumbnail(token, timer)
         if timer["description"]:
             st.text(timer["description"])
 
         if quit_record:
             st.caption("Quit / 中断: " + local_text(quit_record["quit_at"]))
 
-        # This renderer displays statistics only. It exposes no edit controls,
-        # file downloads, private audio, account information, or journal data.
+        # Public content includes statistics and explicitly shared timer
+        # media. No management controls, alarm audio, or journals are exposed.
         _fixed_timer_statistics(timer, quit_record, utc_now())
+        render_shared_timer_videos(token, timer)
 
     st.caption("Read-only shared timer / 読み取り専用タイマー")
 
@@ -3724,6 +3726,7 @@ def handle_public_timer_request():
     # Public requests bypass the rest of main(), so initialize the table needed
     # by the existing theme-aware statistics renderer here as well.
     initialize_timer_visual_preferences()
+    initialize_thumbnail_video_support()
     render_public_shared_timer(token)
     return True
 
@@ -4317,6 +4320,44 @@ window.addEventListener("beforeunload", releaseVideo);
 """
     document = document.replace("__VIDEO_PAYLOAD__", payload)
     video_components.html(document, height=430, scrolling=False)
+
+
+
+# SHARED_TIMER_THUMBNAIL_AND_VIDEOS_V1
+
+def shared_timer_media_access_allowed(token, timer_id):
+    """Revalidate the public capability; do not rely on login state."""
+    if not isinstance(token, str) or len(token) != 43:
+        return False
+
+    result = rows(
+        """
+        SELECT 1
+        FROM timer_public_links p
+        JOIN timers t ON t.id=p.timer_id
+        WHERE p.timer_id=? AND p.token_hash=?
+        """,
+        (timer_id, timer_share_hash(token)),
+    )
+    return bool(result)
+
+
+def render_shared_timer_thumbnail(token, timer):
+    if not shared_timer_media_access_allowed(token, timer["id"]):
+        return
+
+    # The owner ID is resolved from the token-validated database timer,
+    # never from a viewer-supplied user ID.
+    media_render_thumbnail(timer["id"], timer["user_id"])
+
+
+def render_shared_timer_videos(token, timer):
+    if not shared_timer_media_access_allowed(token, timer["id"]):
+        return
+
+    # This renderer exposes playback only, not the authenticated media manager.
+    # Only videos attached directly to this timer are selected.
+    media_render_videos("timer", timer["id"], timer["user_id"])
 
 
 def main():
