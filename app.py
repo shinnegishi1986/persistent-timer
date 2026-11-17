@@ -2383,6 +2383,10 @@ def _timer_editor_content(user, mode):
     # This immutable local value is the UPDATE target.
     # It never depends on title, sound selection, or widget state.
     edit_target_id = source["id"] if editing else None
+
+    if editing and edit_target_id:
+        render_edit_timer_delete_action(edit_target_id, user["id"])
+
     epoch = st.session_state.get("_fixed_new_timer_epoch", 0)
     prefix = f"fixed_timer_{mode}_{source.get('id', 'new')}"
     if creating:
@@ -4489,6 +4493,58 @@ def render_shared_timer_videos(token, timer):
 
 
 # TIMER_VIDEO_FEATURE_REMOVED_V1
+
+
+# EDIT_TIMER_DELETE_ACTION_V1
+
+def render_edit_timer_delete_action(timer_id, user_id):
+    """Destructive action for the saved timer selected in Edit mode only."""
+    found = rows(
+        "SELECT title FROM timers WHERE id=? AND user_id=?",
+        (timer_id, user_id),
+    )
+    if not found:
+        return
+
+    st.markdown(
+        """
+        <style>
+        .st-key-timer_editor_delete_action button {
+            background-color: #B91C1C !important;
+            color: #FFFFFF !important;
+            border: 1px solid #991B1B !important;
+            border-radius: 10px;
+            min-height: 44px;
+            font-weight: 600;
+        }
+        .st-key-timer_editor_delete_action button:hover {
+            background-color: #991B1B !important;
+            border-color: #7F1D1D !important;
+        }
+        .st-key-timer_editor_delete_action button:focus-visible {
+            outline: 3px solid #FCA5A5 !important;
+            outline-offset: 3px;
+        }
+        .st-key-timer_editor_delete_action button p {
+            color: #FFFFFF !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="timer_editor_delete_action"):
+        if st.button(
+            "Delete this timer / このタイマーを削除",
+            type="primary",
+            key=f"_edit_delete_this_timer_{timer_id}",
+        ):
+            confirm_record_deletion("timer", timer_id, found[0]["title"])
+    st.caption(
+        "Deletes the selected saved timer, not just unsaved edits. "
+        "A confirmation dialog opens before deletion. "
+        "選択中の保存済みタイマーを削除します。削除前に確認画面を表示します。"
+    )
+
 
 def main():
     apply_delete_timer_button_color()
