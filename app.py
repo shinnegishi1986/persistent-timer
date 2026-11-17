@@ -3471,7 +3471,7 @@ def timer_share_dialog(timer_id):
     )
 
     try:
-        base_url = retrieve_timer_public_base_url()
+        base_url = timer_path_public_base_url()
     except ValueError as error:
         st.error(str(error))
         return
@@ -3518,11 +3518,8 @@ def timer_share_dialog(timer_id):
     if usable_token:
         try:
             base = timer_share_base_url(base_url)
-            share_url = base + "?" + urlencode({"timer_share": token})
-            embed_url = base + "?" + urlencode({
-                "timer_share": token,
-                "embed": "true",
-            })
+            share_url = base.rstrip("/") + "/timer/" + token
+            embed_url = share_url
 
             st.caption("Share link / 共有リンク")
             st.code(share_url, language=None)
@@ -3690,6 +3687,20 @@ def retrieve_timer_public_base_url():
     return timer_share_base_url(
         urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
     )
+
+
+
+# PATH_BASED_TIMER_SHARING_V1
+
+def timer_path_public_base_url():
+    value = os.environ.get("TIMER_PUBLIC_BASE_URL", "").strip()
+    if not value:
+        raise ValueError(
+            "Set TIMER_PUBLIC_BASE_URL to the host serving public_timer_server.py. "
+            "Path-based links require the separate public timer service. "
+            "公開タイマーサーバーのURLを TIMER_PUBLIC_BASE_URL に設定してください。"
+        )
+    return timer_share_base_url(value).rstrip("/")
 
 
 def main():
