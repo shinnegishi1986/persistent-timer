@@ -2539,6 +2539,15 @@ def _timer_editor_content(user, mode):
     if default_parent not in parent_options:
         default_parent = None
 
+    # CONDITIONAL_TIMER_UNTIL_INPUT_V1
+    unit = st.selectbox(
+        "Duration type / 期間の単位",
+        UNITS,
+        index=UNITS.index(source.get("duration_unit", "days")),
+        format_func=lambda value: UNIT_LABELS[value],
+        key=f"{prefix}_duration_type",
+    )
+
     with st.form(f"{prefix}_form"):
         if editing:
             st.caption(f"Editing timer ID / 編集対象ID: {edit_target_id}")
@@ -2569,41 +2578,38 @@ def _timer_editor_content(user, mode):
             ),
             step=60,
         )
-        unit = st.selectbox(
-            "Duration type / 期間の単位",
-            UNITS,
-            index=UNITS.index(source.get("duration_unit", "days")),
-            format_func=lambda value: UNIT_LABELS[value],
-        )
-        amount = st.number_input(
-            "Duration amount / 期間（指定日時では不使用）",
-            min_value=1,
-            max_value=1_000_000,
-            value=max(1, int(source.get("duration_value", 1))),
-            step=1,
-        )
-        date_col, hour_col, minute_col = st.columns([2, 1, 1])
-        end_day = date_col.date_input(
-            "Until date (JST) / 終了日",
-            value=until_day,
-            min_value=min(date(1900, 1, 1), until_day),
-            max_value=max(date(9998, 12, 31), until_day),
-            format="YYYY/MM/DD",
-        )
-        end_hour = hour_col.number_input(
-            "Hour / 時",
-            min_value=0, max_value=23,
-            value=until_time.hour, step=1, format="%02d",
-        )
-        end_minute = minute_col.number_input(
-            "Minute / 分",
-            min_value=0, max_value=59,
-            value=until_time.minute, step=1, format="%02d",
-        )
-        st.caption(
-            "Until uses the exact selected JST time. Children are independent. "
-            "指定日時は日本時間ちょうどに終了します。子タイマーは独立しています。"
-        )
+        if unit == "until":
+            amount = 1
+            date_col, hour_col, minute_col = st.columns([2, 1, 1])
+            end_day = date_col.date_input(
+                "Until date (JST) / 終了日",
+                value=until_day,
+                min_value=min(date(1900, 1, 1), until_day),
+                max_value=max(date(9998, 12, 31), until_day),
+                format="YYYY/MM/DD",
+            )
+            end_hour = hour_col.number_input(
+                "Hour / 時",
+                min_value=0, max_value=23,
+                value=until_time.hour, step=1, format="%02d",
+            )
+            end_minute = minute_col.number_input(
+                "Minute / 分",
+                min_value=0, max_value=59,
+                value=until_time.minute, step=1, format="%02d",
+            )
+            st.caption(
+                "Until uses the exact selected JST time. Children are independent. "
+                "指定日時は日本時間ちょうどに終了します。子タイマーは独立しています。"
+            )
+        else:
+            amount = st.number_input(
+                "Duration amount / 期間",
+                min_value=1,
+                max_value=1_000_000,
+                value=max(1, int(source.get("duration_value", 1))),
+                step=1,
+            )
         submitted = st.form_submit_button(
             "Update timer / 更新" if editing else "Create timer / 作成",
             type="primary",
@@ -2619,11 +2625,12 @@ def _timer_editor_content(user, mode):
         start = datetime.combine(start_day, start_clock, JST).astimezone(UTC)
         if reserved and start <= utc_now():
             raise ValueError("Choose a future start time (JST). / 現在より後の開始日時を選択してください。")
-        until_text = (
-            end_day.strftime("%Y%m%d")
-            + f"{int(end_hour):02d}{int(end_minute):02d}"
-        )
+        until_text = None
         if unit == "until":
+            until_text = (
+                end_day.strftime("%Y%m%d")
+                + f"{int(end_hour):02d}{int(end_minute):02d}"
+            )
             end = datetime.combine(
                 end_day,
                 datetime_time(int(end_hour), int(end_minute)),
