@@ -2348,6 +2348,7 @@ def timer_editor(user):
         st.success(notice)
 
     modes = ["New / 新規", "Reuse template / 再利用", "Edit / 編集"]
+    modes.insert(1, 'Reserve / 予約')
     for tab, mode in zip(st.tabs(modes), modes):
         with tab:
             _timer_editor_content(user, mode)
@@ -2357,7 +2358,10 @@ def _timer_editor_content(user, mode):
     timers = user_timers(user["id"])
     by_id = {timer["id"]: timer for timer in timers}
     editing = mode == "Edit / 編集"
-    creating = mode == "New / 新規"
+    reserved = mode == 'Reserve / 予約'
+    creating = mode == "New / 新規" or reserved
+    if reserved:
+        st.caption("Choose a future start in Japan Standard Time, then set a duration or an Until date and time. / 日本時間で開始日時を予約し、期間または終了日時を設定してください。")
     source = {}
 
     if not creating:
@@ -2613,6 +2617,8 @@ def _timer_editor_content(user, mode):
             raise ValueError("Title is required / タイトルが必要です。")
 
         start = datetime.combine(start_day, start_clock, JST).astimezone(UTC)
+        if reserved and start <= utc_now():
+            raise ValueError("Choose a future start time (JST). / 現在より後の開始日時を選択してください。")
         until_text = (
             end_day.strftime("%Y%m%d")
             + f"{int(end_hour):02d}{int(end_minute):02d}"
@@ -4696,3 +4702,5 @@ if __name__ == "__main__":
 # TIMER_DASHBOARD_THUMBNAIL_MANAGE_BUTTON_REMOVED_V1
 
 # TIMER_DASHBOARD_DELETE_BUTTON_REMOVED_V1
+
+# RESERVED_TIMER_FEATURE_V1
