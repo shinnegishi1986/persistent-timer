@@ -2524,6 +2524,10 @@ def _timer_editor_content(user, mode):
             if editing else False
         )
 
+        thumbnail_view = thumbnail_view_controls(
+            source.get("id") if editing else None, user["id"], prefix, new_thumbnail
+        )
+
         new_timer_videos = []
         st.caption(
             "New uploads are saved with the timer. "
@@ -2720,6 +2724,7 @@ def _timer_editor_content(user, mode):
                 connection, timer_id, user["id"],
                 prepared_thumbnail, remove=remove_thumbnail,
             )
+            save_thumbnail_view(connection, timer_id, user["id"], thumbnail_view)
             pass  # Timer videos disabled.
 
         if creating:
@@ -2972,6 +2977,25 @@ def _fixed_timer_statistics(timer, quit_record, now):
         .value { font-size: 15px; }
     }
 </style>
+
+<style>
+#remaining, #elapsed, #duration {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.4;
+}
+</style>
+
+<style>
+/* Preserve the literal newline written using textContent. */
+#remaining, #elapsed, #duration {
+    white-space: pre-line !important;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+    font-variant-numeric: tabular-nums;
+}
+</style>
 </head>
 <body>
 <div class="layout">
@@ -3064,16 +3088,19 @@ function setText(id, value) {
 }
 
 function durationText(milliseconds, roundUp) {
-    const value = Math.max(0, milliseconds) / 1000;
-    let seconds = roundUp ? Math.ceil(value) : Math.floor(value);
-    const days = Math.floor(seconds / 86400);
-    seconds %= 86400;
-    const hours = Math.floor(seconds / 3600);
-    seconds %= 3600;
-    const minutes = Math.floor(seconds / 60);
-    seconds %= 60;
+    const numeric = Number(milliseconds);
+    const value = Math.max(0, Number.isFinite(numeric) ? numeric : 0) / 1000;
+    const totalSeconds = roundUp ? Math.ceil(value) : Math.floor(value);
+    const totalHours = Math.floor(totalSeconds / 3600);
+    const days = Math.floor(totalSeconds / 86400);
+    const dayHours = totalHours % 24;
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
     const pad = number => String(number).padStart(2, "0");
-    return `${days}d ${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+    const hoursText = `${pad(totalHours)}:${pad(minutes)}:${pad(seconds)}`;
+    const daysText = `${days}d ${pad(dayHours)}:${pad(minutes)}:${pad(seconds)}`;
+    return `${hoursText}
+${daysText}`;
 }
 
 function render() {
@@ -3186,40 +3213,19 @@ def timer_dashboard(user_id):
     selected_status = st.selectbox(
         "Filter / 表示", statuses, key="_fixed_timer_status_filter", label_visibility="collapsed")
 
-    children = {}
-    roots = []
-    for timer in by_id.values():
-        parent = timer.get("parent_id")
-        if parent in by_id and parent != timer["id"]:
-            children.setdefault(parent, []).append(timer)
-        else:
-            roots.append(timer)
-
-    ordered = []
-    visited = set()
-
-    def append_tree(root):
-        stack = [(root, 0)]
-        while stack:
-            timer, depth = stack.pop()
-            if timer["id"] in visited:
-                continue
-            visited.add(timer["id"])
-            ordered.append((timer, depth))
-            stack.extend(
-                (child, depth + 1)
-                for child in reversed(children.get(timer["id"], []))
-            )
-
-    for root in roots:
-        append_tree(root)
-    # Also display records from malformed/cyclic imported hierarchies once.
-    for timer in by_id.values():
-        if timer["id"] not in visited:
-            append_tree(timer)
+    # Latest start first, regardless of parent/child relationships.
+    ordered = sorted(
+        by_id.values(),
+        key=lambda timer: (
+            parse_stamp(timer["starts_at"]),
+            parse_stamp(timer["created_at"]),
+            timer["id"],
+        ),
+        reverse=True,
+    )
 
     shown = 0
-    for timer, depth in ordered:
+    for timer in ordered:
         quit_record = _fixed_timer_quit(timer)
         status = _fixed_timer_status(timer, quit_record)
         if selected_status != "All / すべて" and selected_status != status:
@@ -3227,8 +3233,7 @@ def timer_dashboard(user_id):
 
         shown += 1
         with st.container(border=True):
-            prefix = "↳ " * min(depth, 5)
-            st.subheader(prefix + timer["title"])
+            st.subheader(timer["title"])
             media_render_thumbnail(timer["id"], user_id)
             st.caption(f"{status} · ID: {timer['id']}")
             if timer.get("parent_id") in by_id:
@@ -3669,6 +3674,8 @@ def initialize_thumbnail_video_support():
             """
         )
 
+    initialize_thumbnail_view_settings()
+
 
 def media_record_column(kind):
     if kind == "timer":
@@ -3785,33 +3792,6 @@ def media_save_thumbnail(connection, timer_id, user_id, content, remove=False):
         )
 
 
-def media_render_thumbnail(timer_id, user_id):
-    import base64 as media_base64
-
-    result = rows(
-        """
-        SELECT p.content
-        FROM timer_thumbnails p JOIN timers t ON t.id=p.timer_id
-        WHERE t.id=? AND t.user_id=?
-        """,
-        (timer_id, user_id),
-    )
-    if not result:
-        return
-
-    encoded = media_base64.b64encode(result[0]["content"]).decode("ascii")
-    st.markdown(
-        '<div style="position:relative;margin:8px 0 18px;border-radius:16px;'
-        'overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.15);">'
-        '<img alt="Timer thumbnail" src="data:image/jpeg;base64,'
-        + encoded
-        + '" style="display:block;width:100%;height:clamp(150px,24vw,290px);'
-          'object-fit:cover;object-position:center;">'
-          '<div style="position:absolute;inset:0;pointer-events:none;'
-          'background:linear-gradient(180deg,transparent 55%,rgba(0,0,0,.18));">'
-          '</div></div>',
-        unsafe_allow_html=True,
-    )
 
 
 def media_video_list(kind, record_id, user_id):
@@ -3883,6 +3863,11 @@ def media_manage_dialog(kind, record_id):
     if kind == "timer":
         st.subheader("Thumbnail / サムネイル")
         media_render_thumbnail(record_id, user["id"])
+        thumbnail_view = thumbnail_view_controls(record_id, user["id"], prefix)
+        if st.button("Save display position / 表示位置を保存", key=f"{prefix}_save_view"):
+            with database() as connection:
+                save_thumbnail_view(connection, record_id, user["id"], thumbnail_view)
+            st.rerun()
         replacement = st.file_uploader(
             "Upload / replace thumbnail · 画像登録・差替え",
             type=["jpg", "jpeg", "png", "webp"],
@@ -4572,6 +4557,155 @@ def timer_share_dialog(timer_id):
         st.rerun()
 
 
+
+# TIMER_THUMBNAIL_VISIBLE_AREA_V1
+
+def initialize_thumbnail_view_settings():
+    with database() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS timer_thumbnail_view (
+                timer_id TEXT PRIMARY KEY REFERENCES timers(id) ON DELETE CASCADE,
+                x INTEGER NOT NULL DEFAULT 50 CHECK(x BETWEEN 0 AND 100),
+                y INTEGER NOT NULL DEFAULT 50 CHECK(y BETWEEN 0 AND 100),
+                fit TEXT NOT NULL DEFAULT 'cover' CHECK(fit IN ('cover','contain'))
+            )
+        """)
+
+
+def load_thumbnail_view(timer_id, user_id):
+    result = rows(
+        "SELECT v.x,v.y,v.fit FROM timer_thumbnail_view v "
+        "JOIN timers t ON t.id=v.timer_id WHERE t.id=? AND t.user_id=?",
+        (timer_id or "", user_id),
+    )
+    return result[0] if result else {"x": 50, "y": 50, "fit": "cover"}
+
+
+def save_thumbnail_view(connection, timer_id, user_id, view):
+    media_require_owner(connection, "timer", timer_id, user_id)
+    x, y, fit = int(view["x"]), int(view["y"]), view["fit"]
+    if not (0 <= x <= 100 and 0 <= y <= 100 and fit in {"cover", "contain"}):
+        raise ValueError("Invalid thumbnail position.")
+    connection.execute(
+        "INSERT INTO timer_thumbnail_view(timer_id,x,y,fit) VALUES (?,?,?,?) "
+        "ON CONFLICT(timer_id) DO UPDATE SET x=excluded.x,y=excluded.y,fit=excluded.fit",
+        (timer_id, x, y, fit),
+    )
+
+
+def thumbnail_view_image(content, view):
+    import base64
+    encoded = base64.b64encode(bytes(content)).decode("ascii")
+    x = max(0, min(100, int(view["x"])))
+    y = max(0, min(100, int(view["y"])))
+    fit = "contain" if view["fit"] == "contain" else "cover"
+    st.markdown(
+        '<div style="margin:8px 0 18px;border-radius:16px;overflow:hidden;'
+        'background:#111827;box-shadow:0 8px 24px rgba(0,0,0,.15)">'
+        '<img alt="Timer thumbnail" src="data:image/jpeg;base64,' + encoded
+        + '" style="display:block;width:100%;height:clamp(150px,24vw,290px);'
+        + f'object-fit:{fit};object-position:{x}% {y}%;"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def media_render_thumbnail(timer_id, user_id):
+    result = rows(
+        "SELECT p.content FROM timer_thumbnails p JOIN timers t ON t.id=p.timer_id "
+        "WHERE t.id=? AND t.user_id=?", (timer_id, user_id),
+    )
+    if result:
+        thumbnail_view_image(result[0]["content"], load_thumbnail_view(timer_id, user_id))
+
+
+
+# LIVE_THUMBNAIL_PREVIEW_V1
+
+def thumbnail_live_preview(content, view):
+    """Render the actual cropped image in an isolated HTML component."""
+    import base64
+    import streamlit.components.v1 as components
+    encoded = base64.b64encode(bytes(content)).decode("ascii")
+    x = max(0, min(100, int(view["x"])))
+    y = max(0, min(100, int(view["y"])))
+    fit = "contain" if view["fit"] == "contain" else "cover"
+    document = (
+        '<!doctype html><html lang="ja"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>html,body{margin:0;padding:0;background:transparent;'
+        'font-family:system-ui,sans-serif}.frame{width:100%;'
+        'height:clamp(150px,24vw,290px);background:#111827;border-radius:16px;'
+        'overflow:hidden}img{display:block;width:100%;height:100%;'
+        + f'object-fit:{fit};object-position:{x}% {y}%;'
+        + '}#error{color:#b91c1c;font-size:14px;margin:8px 0}</style>'
+        '</head><body><div class="frame"><img id="preview" '
+        'alt="Thumbnail framing preview / 表示位置プレビュー" '
+        'src="data:image/jpeg;base64,' + encoded + '"></div>'
+        '<p id="error" role="status"></p><script>'
+        'document.getElementById("preview").addEventListener("error",function(){'
+        'document.getElementById("error").textContent='
+        '"Image preview could not load / 画像を表示できません。";});'
+        '</script></body></html>'
+    )
+    components.html(document, height=330, scrolling=False)
+
+
+def thumbnail_view_controls(timer_id, user_id, prefix, upload=None):
+    defaults = load_thumbnail_view(timer_id, user_id)
+    st.caption("Adjust thumbnail and check the preview below / 下のプレビューで表示位置を確認")
+    fit = st.selectbox(
+        "Display mode / 表示方法", ["cover", "contain"],
+        index=0 if defaults["fit"] == "cover" else 1,
+        format_func=lambda value: (
+            "Fill frame / 枠いっぱい（位置調整）" if value == "cover"
+            else "Show entire image / 画像全体（切り抜きなし）"
+        ), key=f"{prefix}_view_fit",
+    )
+    x = st.slider(
+        "Horizontal position / 横位置（左 → 右）", 0, 100,
+        int(defaults["x"]), key=f"{prefix}_view_x", disabled=fit == "contain",
+    )
+    y = st.slider(
+        "Vertical position / 縦位置（上 → 下）", 0, 100,
+        int(defaults["y"]), key=f"{prefix}_view_y", disabled=fit == "contain",
+    )
+    view = {"x": x, "y": y, "fit": fit}
+    content = None
+    if upload is not None:
+        try:
+            content = media_prepare_thumbnail(upload)
+        except ValueError as error:
+            st.error(str(error))
+    elif timer_id:
+        result = rows(
+            "SELECT p.content FROM timer_thumbnails p "
+            "JOIN timers t ON t.id=p.timer_id WHERE t.id=? AND t.user_id=?",
+            (timer_id, user_id),
+        )
+        if result:
+            content = result[0]["content"]
+    if content:
+        st.caption(f"Live preview / プレビュー · X {x}% · Y {y}%")
+        thumbnail_live_preview(content, view)
+        st.caption(
+            "Move a slider, then release it to refresh the preview. "
+            "Save the timer (or Save display position in the thumbnail manager) "
+            "to keep these settings. スライダーを離すとプレビューが更新されます。"
+        )
+        st.caption(
+            "Only cropped axes can move. If horizontal movement does nothing, "
+            "try vertical movement, or select Show entire image. "
+            "画像が枠からはみ出していない方向は動きません。"
+        )
+    else:
+        st.info(
+            "No thumbnail available to preview. Upload an image or select a timer "
+            "with a saved thumbnail. プレビュー用の画像を登録してください。"
+        )
+    return view
+
+
+
 def main():
     apply_delete_timer_button_color()
     initialize()
@@ -4711,3 +4845,11 @@ if __name__ == "__main__":
 # TIMER_DASHBOARD_DELETE_BUTTON_REMOVED_V1
 
 # RESERVED_TIMER_FEATURE_V1
+
+# TIMER_FLAT_DESCENDING_START_ORDER_V1
+
+# TIMER_TOTAL_HOURS_DISPLAY_V1
+
+# TIMER_DUAL_TIME_FORMAT_V1
+
+# TIMER_TWO_LINE_TIME_DISPLAY_20261121_PT1
