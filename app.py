@@ -2513,6 +2513,7 @@ def _timer_editor_content(user, mode):
             type=["jpg", "jpeg", "png", "webp"],
             key=f"{prefix}_thumbnail",
         )
+        new_thumbnail = thumbnail_library_picker(user["id"], prefix, new_thumbnail)
         if new_thumbnail:
             st.image(new_thumbnail.getvalue(), caption="Preview / プレビュー")
 
@@ -3676,6 +3677,8 @@ def initialize_thumbnail_video_support():
 
     initialize_thumbnail_view_settings()
 
+    initialize_thumbnail_library()
+
 
 def media_record_column(kind):
     if kind == "timer":
@@ -3774,6 +3777,7 @@ def media_insert_videos(connection, kind, record_id, user_id, prepared):
 
 def media_save_thumbnail(connection, timer_id, user_id, content, remove=False):
     media_require_owner(connection, "timer", timer_id, user_id)
+    archive_thumbnail_change(connection, timer_id, user_id, content)
     if remove:
         connection.execute(
             "DELETE FROM timer_thumbnails WHERE timer_id=?", (timer_id,)
@@ -3873,6 +3877,7 @@ def media_manage_dialog(kind, record_id):
             type=["jpg", "jpeg", "png", "webp"],
             key=f"{prefix}_thumbnail",
         )
+        replacement = thumbnail_library_picker(user["id"], prefix, replacement)
         if replacement:
             st.image(replacement.getvalue(), caption="Preview / プレビュー")
         if st.button("Save thumbnail / 画像を保存", key=f"{prefix}_save_thumbnail"):
@@ -4704,6 +4709,127 @@ def thumbnail_view_controls(timer_id, user_id, prefix, upload=None):
         )
     return view
 
+
+
+
+# REUSABLE_THUMBNAIL_LIBRARY_V1
+
+def thumbnail_library_archive(connection, user_id, content, label):
+    import hashlib
+    if not content:
+        return
+    digest = hashlib.sha256(bytes(content)).hexdigest()
+    connection.execute(
+        "INSERT OR IGNORE INTO thumbnail_library "
+        "(id,user_id,content_hash,label,content,created_at) VALUES (?,?,?,?,?,?)",
+        (identifier(), user_id, digest, str(label or "Thumbnail")[:200], content, stamp()),
+    )
+
+
+def initialize_thumbnail_library():
+    with database() as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS thumbnail_library (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                label TEXT NOT NULL,
+                content BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id,content_hash)
+            );
+            CREATE INDEX IF NOT EXISTS thumbnail_library_owner
+                ON thumbnail_library(user_id,created_at DESC);
+            CREATE TABLE IF NOT EXISTS thumbnail_library_meta (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
+        """)
+        connection.execute("BEGIN IMMEDIATE")
+        if not connection.execute(
+            "SELECT 1 FROM thumbnail_library_meta WHERE key='initial_import_v1'"
+        ).fetchone():
+            # Read each existing BLOB once; later startups skip this backfill.
+            existing = connection.execute(
+                "SELECT t.user_id,t.title,p.content FROM timer_thumbnails p "
+                "JOIN timers t ON t.id=p.timer_id"
+            )
+            for image in existing:
+                thumbnail_library_archive(
+                    connection, image["user_id"], image["content"], image["title"]
+                )
+            connection.execute(
+                "INSERT INTO thumbnail_library_meta(key,value) VALUES ('initial_import_v1','done')"
+            )
+
+
+def archive_thumbnail_change(connection, timer_id, user_id, content):
+    # Called only after the original owner check, within the save transaction.
+    old = connection.execute(
+        "SELECT t.title,p.content FROM timers t LEFT JOIN timer_thumbnails p "
+        "ON p.timer_id=t.id WHERE t.id=? AND t.user_id=?", (timer_id, user_id),
+    ).fetchone()
+    if old:
+        thumbnail_library_archive(connection, user_id, old["content"], old["title"])
+        thumbnail_library_archive(connection, user_id, content, old["title"])
+
+
+class LibraryThumbnailUpload:
+    """UploadedFile-compatible image for the existing thumbnail save/preview path."""
+    def __init__(self, content):
+        self._content = bytes(content)
+        self.size = len(self._content)
+        self.name = "reused-thumbnail.jpg"
+        self.type = "image/jpeg"
+
+    def getvalue(self):
+        return self._content
+
+
+def thumbnail_library_picker(user_id, prefix, upload=None):
+    total = rows("SELECT COUNT(*) AS n FROM thumbnail_library WHERE user_id=?", (user_id,))[0]["n"]
+    if not total:
+        st.caption("Saved uploads will become available here for reuse. / 保存した画像は次回から再利用できます。")
+        return upload
+    mode = st.radio(
+        "Thumbnail source / サムネイルの選択元",
+        ["Upload / アップロード", "Past thumbnails / 過去の画像"],
+        key=f"{prefix}_library_mode",
+    )
+    if mode.startswith("Upload"):
+        return upload
+    pages = (total + 49) // 50
+    page = int(st.number_input(
+        "Image library page / 画像一覧ページ", min_value=1, max_value=pages,
+        value=1, step=1, key=f"{prefix}_library_page_{pages}",
+    ))
+    images = rows(
+        "SELECT id,label,created_at FROM thumbnail_library WHERE user_id=? "
+        "ORDER BY created_at DESC,id DESC LIMIT 50 OFFSET ?", (user_id, (page-1)*50),
+    )
+    options = {item["id"]: item for item in images}
+    key = f"{prefix}_library_choice_{page}"
+    if key in st.session_state and st.session_state[key] not in [None] + list(options):
+        del st.session_state[key]
+    selected = st.selectbox(
+        "Choose a previously saved image / 保存済み画像を選択", [None] + list(options),
+        format_func=lambda value: (
+            "Select an image / 画像を選択" if value is None
+            else options[value]["label"] + " · " + local_text(options[value]["created_at"])
+        ), key=key,
+    )
+    st.caption(
+        "Only your saved images are listed. The choice takes effect when you save "
+        "the timer or thumbnail. Removing a timer thumbnail does not delete its "
+        "library copy. 自分の画像のみ表示します。選択後に保存してください。"
+    )
+    if not selected:
+        return None
+    found = rows("SELECT content FROM thumbnail_library WHERE id=? AND user_id=?", (selected, user_id))
+    if not found:
+        st.warning("Image is no longer available / 画像が見つかりません。")
+        return None
+    st.image(found[0]["content"], caption="Selected past image / 選択した過去の画像")
+    return LibraryThumbnailUpload(found[0]["content"])
 
 
 def main():
